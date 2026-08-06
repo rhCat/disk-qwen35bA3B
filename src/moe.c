@@ -196,6 +196,19 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
         tl->ffn_norm[L] = -1;
         tl->hc_attn_fn[L] = tl->hc_attn_base[L] = tl->hc_attn_scale[L] = -1;
         tl->hc_ffn_fn[L] = tl->hc_ffn_base[L] = tl->hc_ffn_scale[L] = -1;
+        /* Qwen3.5 attention roles: GQA (self_attn) + linear (linear_attn) */
+        tl->q3_q[L] = tl->q3_qs[L] = tl->q3_qb[L] = -1;
+        tl->q3_k[L] = tl->q3_ks[L] = tl->q3_kb[L] = -1;
+        tl->q3_v[L] = tl->q3_vs[L] = tl->q3_vb[L] = -1;
+        tl->q3_o[L] = tl->q3_os[L] = tl->q3_ob[L] = -1;
+        tl->q3_qn[L] = tl->q3_kn[L] = -1;
+        tl->q3_conv[L] = tl->q3_a_log[L] = tl->q3_dt[L] = -1;
+        tl->q3_pqkv[L] = tl->q3_pqkvs[L] = tl->q3_pqkvb[L] = -1;
+        tl->q3_pz[L] = tl->q3_pzs[L] = tl->q3_pzb[L] = -1;
+        tl->q3_pa[L] = tl->q3_pas[L] = tl->q3_pab[L] = -1;
+        tl->q3_pb[L] = tl->q3_pbs[L] = tl->q3_pbb[L] = -1;
+        tl->q3_opa[L] = tl->q3_opas[L] = tl->q3_opab[L] = -1;
+        tl->q3_lnorm[L] = -1;
     }
     tl->hc_head_fn = tl->hc_head_base = tl->hc_head_scale = -1;
     tl->kvlat = 0;
@@ -359,6 +372,72 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
                     if (tl->hc_head_base < 0) tl->hc_head_base = k - 1;
                 } else if (name_ends(tt->name, ".hc_head_scale")) {
                     if (tl->hc_head_scale < 0) tl->hc_head_scale = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.q_proj.weight")) {
+                    if (tl->q3_q[L] < 0) tl->q3_q[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.q_proj.scales")) {
+                    if (tl->q3_qs[L] < 0) tl->q3_qs[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.q_proj.biases")) {
+                    if (tl->q3_qb[L] < 0) tl->q3_qb[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.k_proj.weight")) {
+                    if (tl->q3_k[L] < 0) tl->q3_k[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.k_proj.scales")) {
+                    if (tl->q3_ks[L] < 0) tl->q3_ks[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.k_proj.biases")) {
+                    if (tl->q3_kb[L] < 0) tl->q3_kb[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.v_proj.weight")) {
+                    if (tl->q3_v[L] < 0) tl->q3_v[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.v_proj.scales")) {
+                    if (tl->q3_vs[L] < 0) tl->q3_vs[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.v_proj.biases")) {
+                    if (tl->q3_vb[L] < 0) tl->q3_vb[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.o_proj.weight")) {
+                    if (tl->q3_o[L] < 0) tl->q3_o[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.o_proj.scales")) {
+                    if (tl->q3_os[L] < 0) tl->q3_os[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.o_proj.biases")) {
+                    if (tl->q3_ob[L] < 0) tl->q3_ob[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.q_norm.weight")) {
+                    if (tl->q3_qn[L] < 0) tl->q3_qn[L] = k - 1;
+                } else if (name_ends(tt->name, ".self_attn.k_norm.weight")) {
+                    if (tl->q3_kn[L] < 0) tl->q3_kn[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.conv1d.weight")) {
+                    if (tl->q3_conv[L] < 0) tl->q3_conv[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.A_log")) {
+                    if (tl->q3_a_log[L] < 0) tl->q3_a_log[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.dt_bias")) {
+                    if (tl->q3_dt[L] < 0) tl->q3_dt[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_qkv.weight")) {
+                    if (tl->q3_pqkv[L] < 0) tl->q3_pqkv[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_qkv.scales")) {
+                    if (tl->q3_pqkvs[L] < 0) tl->q3_pqkvs[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_qkv.biases")) {
+                    if (tl->q3_pqkvb[L] < 0) tl->q3_pqkvb[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_z.weight")) {
+                    if (tl->q3_pz[L] < 0) tl->q3_pz[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_z.scales")) {
+                    if (tl->q3_pzs[L] < 0) tl->q3_pzs[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_z.biases")) {
+                    if (tl->q3_pzb[L] < 0) tl->q3_pzb[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_a.weight")) {
+                    if (tl->q3_pa[L] < 0) tl->q3_pa[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_a.scales")) {
+                    if (tl->q3_pas[L] < 0) tl->q3_pas[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_a.biases")) {
+                    if (tl->q3_pab[L] < 0) tl->q3_pab[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_b.weight")) {
+                    if (tl->q3_pb[L] < 0) tl->q3_pb[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_b.scales")) {
+                    if (tl->q3_pbs[L] < 0) tl->q3_pbs[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.in_proj_b.biases")) {
+                    if (tl->q3_pbb[L] < 0) tl->q3_pbb[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.out_proj.weight")) {
+                    if (tl->q3_opa[L] < 0) tl->q3_opa[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.out_proj.scales")) {
+                    if (tl->q3_opas[L] < 0) tl->q3_opas[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.out_proj.biases")) {
+                    if (tl->q3_opab[L] < 0) tl->q3_opab[L] = k - 1;
+                } else if (name_ends(tt->name, ".linear_attn.norm.weight")) {
+                    if (tl->q3_lnorm[L] < 0) tl->q3_lnorm[L] = k - 1;
                 }
             }
         }

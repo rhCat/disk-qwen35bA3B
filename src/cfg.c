@@ -71,6 +71,8 @@ int ds4f_cfg_load(Ds4fCfg *cfg, const char *model_dir) {
         const JEntry *e = json_get(doc->root, doc->nroot,
                                    "num_attention_heads");
         cfg->n_heads = (e && e->type == 0) ? (int)e->inum : 0;
+        e = json_get(doc->root, doc->nroot, "num_key_value_heads");
+        cfg->n_kv_heads = (e && e->type == 0) ? (int)e->inum : 0;
         e = json_get(doc->root, doc->nroot, "qk_rope_head_dim");
         cfg->qk_rope = (e && e->type == 0) ? (int)e->inum : 0;
         /* tyrope (yarn-style rope correction) params; 0 = plain rotary */

@@ -239,8 +239,17 @@ int main(int argc, char **argv) {
             }
         }
         plan.state_b += (double)scratch_n * 4.0 * (double)cfg.topk;
-        /* KV cache (MLA, per-layer): kvlat x 4B x n_layers x gen */
+        /* KV cache: MLA (DS-V4, kvlat) or Qwen3 GQA (krows+vrows from
+         * the first self_attn layer). Qwen3: 512+512=1024 floats/token. */
         int kvlat = tl.kvlat;
+        if (kvlat < 1) {
+            for (int L2 = 0; L2 < cfg.n_layers && kvlat < 1; L2++) {
+                if (tl.q3_k[L2] >= 0) {
+                    kvlat = (int)tl.t[tl.q3_k[L2]].dims[0] +
+                            (int)tl.t[tl.q3_v[L2]].dims[0];
+                }
+            }
+        }
         if (kvlat < 1) kvlat = 1;
         if (ds4f_kv_init(&kvc, cfg.n_layers, kvlat, gen) != 0) {
             fprintf(stderr, "moe: kv cache init failed\n");
@@ -460,7 +469,14 @@ int main(int argc, char **argv) {
             /* MLA attention first: it reads/writes state, and the
              * router below sees the post-attention state (real order) */
             if (use_real && kv_ok && !getenv("DS4F_SKIP_ATTN")) {
-                if (ds4f_attn_step(&cfg, &tl, L, tr, state, &kvc, t) != 0) {
+                int q3_layer = (tl.q3_q[L] >= 0) || (tl.q3_conv[L] >= 0);
+                int rc;
+                if (q3_layer)
+                    rc = ds4f_attn_qwen_step(&cfg, &tl, L, tr, state,
+                                             &kvc, t);
+                else
+                    rc = ds4f_attn_step(&cfg, &tl, L, tr, state, &kvc, t);
+                if (rc != 0) {
                     fprintf(stderr, "attn step failed at layer %d\n", L);
                     return 2;
                 }
