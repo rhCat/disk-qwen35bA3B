@@ -18,15 +18,18 @@ POOL="${2:-/tmp/q35-pool}"
 GEN="${GEN:-4}"
 LIMIT="${LIMIT:-23}"
 
+TOK="${TOK:-/Users/ruihe/.cache/huggingface/mlx-qwen35-a3b-4bit/tokenizer.json}"
 echo "=== real-scale run: trunk $TRUNK, pool $POOL, gen $GEN, limit ${LIMIT}GB ==="
 "$REPO_ROOT/ds4f" "$TRUNK" \
   --trunk "$TRUNK/trunk.bin" --offsets "$TRUNK/trunk.offsets" \
   --pool "$POOL/pool.bin" \
   --layout-trunk "$TRUNK/trunk.json" \
   --layout-pool "$POOL/manifest.json" \
+  --head "$TRUNK/head.json" --embed "$TRUNK/embed.json" \
+  --tokenizer "$TOK" --text "Hello" \
   --gen "$GEN" --cache-gb 2 --pin-layers 4 \
   --mem-limit-gb "$LIMIT" \
   > /tmp/q35-run.log 2>&1
 rc=$?
 echo "exit: $rc"
-grep -E 'MEMORY LIMIT|config:|pool:|trunk layout|pool layout|run report|resident|peak|GB/token|bytes|read|tokens/s|WARNING|dropped|maximum|matvec|moe:' /tmp/q35-run.log | tail -20
+grep -E 'MEMORY LIMIT|config:|pool:|trunk layout|pool layout|run report|resident|peak|GB/token|bytes|read|tokens/s|WARNING|dropped|maximum|matvec|moe:|^Hello|logits' /tmp/q35-run.log | tail -22

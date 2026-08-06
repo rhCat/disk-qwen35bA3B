@@ -317,9 +317,12 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (head_path && embed_path) {
-        if (ds4f_head_load(&head, head_path) != 0 ||
-            ds4f_embed_load(&embed, embed_path) != 0) {
-            fprintf(stderr, "text mode init failed\n");
+        if (ds4f_head_load(&head, head_path) != 0) {
+            fprintf(stderr, "head load failed (%s)\n", head_path);
+            return 1;
+        }
+        if (ds4f_embed_load(&embed, embed_path) != 0) {
+            fprintf(stderr, "embed load failed (%s)\n", embed_path);
             return 1;
         }
         long V = head.dims[0];

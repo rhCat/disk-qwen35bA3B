@@ -170,11 +170,16 @@ def main():
                         raise RuntimeError("short read")
                     of.write(got)
                     left -= len(got)
-        meta = {"bin": f"{tag}.bin", "dtype": dt, "shape": shp,
-                "nbytes": nb, "scale": None}
-        # MLX triplet: append scales + biases (byte offsets recorded)
+        meta = {"bin": f"{tag}.bin",
+                "weight": {"off": 0, "nbytes": nb, "dtype": dt,
+                           "shape": shp},
+                "scale": None, "bias": None}
+        # MLX triplet: append scales + biases (byte offsets recorded).
+        # Sibling names: lm_head.scales / lm_head.biases (the .weight is
+        # replaced, NOT appended -- the pool splitter's pattern).
+        base = cand.rsplit(".", 1)[0]
         for suffix, key in ((".scales", "scale"), (".biases", "bias")):
-            sc = cand + suffix
+            sc = base + suffix
             if sc in wm:
                 fn2, off2, nb2, dt2, shp2 = span(sc)
                 with open(out_path, "ab") as of:

@@ -57,7 +57,16 @@ int ds4f_head_load(Ds4fHead *h, const char *json_path) {
     const JEntry *bin = json_get(doc->root, doc->nroot, "bin");
     const JEntry *w = json_get(doc->root, doc->nroot, "weight");
     const JEntry *s = json_get(doc->root, doc->nroot, "scale");
-    if (!bin || !w || bin->type != 1) { json_free(doc); free(js); return -1; }
+    if (!bin || bin->type != 1) { json_free(doc); free(js); return -1; }
+    /* weight layout: nested object {off,nbytes,dtype,shape} (MLX
+     * triplet) or flat top-level keys (legacy). Resolve to a common
+     * view: parent = the object holding off/nbytes/dtype. */
+    const JEntry *wobj = (w && w->type == 2) ? w : doc->root;
+    int wflat = (w && w->type == 2) ? 0 : 1;
+    /* json_get takes the CHILD ARRAY: nested objects use w->child,
+     * flat layout uses doc->root itself */
+    const JEntry *warr = (w && w->type == 2) ? w->child : doc->root;
+    int wcnt = (w && w->type == 2) ? w->nchild : doc->nroot;
     /* scale is OPTIONAL (a checkpoint may keep the head unquantized);
      * null/absent means no scales -> 1.0 everywhere */
     if (s && s->type == 2 && s->child) {
@@ -85,9 +94,9 @@ int ds4f_head_load(Ds4fHead *h, const char *json_path) {
             bin_path[dl] = '/';
         }
     }
-    h->w_off = jnum(json_get(w->child, w->nchild, "off"), 0);
-    h->w_nbytes = jnum(json_get(w->child, w->nchild, "nbytes"), 0);
-    const JEntry *wdt = json_get(w->child, w->nchild, "dtype");
+    h->w_off = jnum(json_get(warr, wcnt, "off"), 0);
+    h->w_nbytes = jnum(json_get(warr, wcnt, "nbytes"), 0);
+    const JEntry *wdt = json_get(warr, wcnt, "dtype");
     if (wdt && wdt->type == 1) {
         size_t wn = (size_t)(wdt->str_end - wdt->str);
         if (wn == 7 && !memcmp(wdt->str, "F8_E4M3", 7)) h->w_dtype = 2;
@@ -96,10 +105,18 @@ int ds4f_head_load(Ds4fHead *h, const char *json_path) {
         else if (wn == 2 && !memcmp(wdt->str, "I8", 2)) h->w_dtype = 1;
         else if ((wn == 3 && !memcmp(wdt->str, "F16", 3)) ||
                  (wn == 4 && !memcmp(wdt->str, "FP16", 4))) h->w_dtype = 5;
+        else if (wn == 3 && !memcmp(wdt->str, "U32", 3)) h->w_dtype = 6;
         else h->w_dtype = 3;
     }
-    jshape(json_get(w->child, w->nchild, "shape"), h->dims, &h->rank);
-    jshape(json_get(s->child, s->nchild, "shape"), h->sdims, &h->srank);
+    jshape(json_get(warr, wcnt, "shape"), h->dims, &h->rank);
+    /* MLX bias triplet (per-64-group BF16), optional like scale */
+    {
+        const JEntry *b = json_get(doc->root, doc->nroot, "bias");
+        if (b && b->type == 2 && b->child) {
+            h->b_off = jnum(json_get(b->child, b->nchild, "off"), 0);
+            h->b_nbytes = jnum(json_get(b->child, b->nchild, "nbytes"), 0);
+        }
+    }
     json_free(doc);
     free(js);
 
@@ -111,10 +128,10 @@ int ds4f_head_load(Ds4fHead *h, const char *json_path) {
         return -1;
     }
     if (h->w_dtype != 0 && h->w_dtype != 1 && h->w_dtype != 2 &&
-        h->w_dtype != 4 && h->w_dtype != 5) {
+        h->w_dtype != 4 && h->w_dtype != 5 && h->w_dtype != 6) {
         fprintf(stderr,
                 "head: weight dtype \"%.*s\" unsupported "
-                "(F32/I8/F8_E4M3/BF16/F16)\n",
+                "(F32/I8/F8_E4M3/BF16/F16/U32)\n",
                 wdt ? (int)(wdt->str_end - wdt->str) : 0,
                 wdt ? wdt->str : "?");
         ds4f_head_free(h);
@@ -141,15 +158,31 @@ int ds4f_embed_load(Ds4fEmbed *e, const char *json_path) {
     JDoc *doc = json_parse(js, (size_t)jlen);
     if (!doc) { free(js); return -1; }
     const JEntry *bin = json_get(doc->root, doc->nroot, "bin");
-    const JEntry *dt = json_get(doc->root, doc->nroot, "dtype");
-    if (!bin || bin->type != 1) { json_free(doc); free(js); return -1; }
-    jshape(json_get(doc->root, doc->nroot, "shape"), e->dims, &e->rank);
+    const JEntry *w = json_get(doc->root, doc->nroot, "weight");
+    if (!bin || bin->type != 1) {
+        json_free(doc); free(js); return -1;
+    }
+    int w_nested = (w && w->type == 2);
+    const JEntry *wobj = w_nested ? w : doc->root;
+    /* json_get takes the CHILD ARRAY: nested objects use w->child,
+     * flat layout uses doc->root itself */
+    const JEntry *warr = w_nested ? w->child : doc->root;
+    int wcnt = w_nested ? w->nchild : doc->nroot;
+    const JEntry *dt = json_get(warr, wcnt, "dtype");
+    jshape(json_get(warr, wcnt, "shape"), e->dims, &e->rank);
     const JEntry *sc = json_get(doc->root, doc->nroot, "scale");
     if (sc && sc->type == 2 && sc->child) {
         e->s_off = jnum(json_get(sc->child, sc->nchild, "off"), 0);
         e->s_nbytes = jnum(json_get(sc->child, sc->nchild, "nbytes"), 0);
         jshape(json_get(sc->child, sc->nchild, "shape"),
                e->sdims, &e->srank);
+    }
+    {
+        const JEntry *b = json_get(doc->root, doc->nroot, "bias");
+        if (b && b->type == 2 && b->child) {
+            e->b_off = jnum(json_get(b->child, b->nchild, "off"), 0);
+            e->b_nbytes = jnum(json_get(b->child, b->nchild, "nbytes"), 0);
+        }
     }
     e->dtype = 3;
     if (dt && dt->type == 1) {
@@ -160,6 +193,7 @@ int ds4f_embed_load(Ds4fEmbed *e, const char *json_path) {
         else if ((dn == 3 && !memcmp(dt->str, "F16", 3)) ||
                  (dn == 4 && !memcmp(dt->str, "FP16", 4))) e->dtype = 5;
         else if (dn == 7 && !memcmp(dt->str, "F8_E4M3", 7)) e->dtype = 2;
+        else if (dn == 3 && !memcmp(dt->str, "U32", 3)) e->dtype = 6;
     }
     /* copy the bin path BEFORE freeing the json buffer */
     {
@@ -171,10 +205,11 @@ int ds4f_embed_load(Ds4fEmbed *e, const char *json_path) {
         json_free(doc);
         free(js);
         if (e->dtype != 0 && e->dtype != 1 && e->dtype != 2 &&
-            e->dtype != 4 && e->dtype != 5) {
+            e->dtype != 4 && e->dtype != 5 && e->dtype != 6) {
             fprintf(stderr,
-                    "embed: dtype \"%.*s\" unsupported "
-                    "(F32/I8/F8_E4M3/BF16/F16)\n",
+                    "embed: dtype %d \"%.*s\" unsupported "
+                    "(F32/I8/F8_E4M3/BF16/F16/U32)\n",
+                    e->dtype,
                     dt ? (int)(dt->str_end - dt->str) : 0,
                     dt ? dt->str : "?");
             return -1;
@@ -199,7 +234,12 @@ void ds4f_embed_free(Ds4fEmbed *e) {
 }
 
 int ds4f_head_logits(const Ds4fHead *h, const float *state, float *logits) {
-    if (!h || !h->buf || h->rank != 2) return -1;
+    if (!h || !h->buf || h->rank != 2) {
+        fprintf(stderr, "head logits: h=%p buf=%p rank=%d\n",
+                (const void *)h, h ? (const void *)h->buf : NULL,
+                h ? h->rank : -99);
+        return -1;
+    }
     long V = h->dims[0], H = h->dims[1];
     const uint8_t *scales = NULL;
     int SR = 1, SC = 1;
@@ -215,6 +255,16 @@ int ds4f_head_logits(const Ds4fHead *h, const float *state, float *logits) {
     if (h->w_dtype == 2) {
         ds4f_f8_matvec(h->buf + h->w_off, scales,
                        (int)V, (int)H, SR, SC, state, logits);
+    } else if (h->w_dtype == 6) {
+        /* MLX 4-bit head: U32 nibbles + BF16 scale/bias per 64-group.
+         * dims are PACKED cols; decoded H = dims[1] * 8. */
+        long Hdec = H * 8;
+        const uint16_t *bias = h->b_nbytes > 0
+            ? (const uint16_t *)(const void *)(h->buf + h->b_off) : NULL;
+        ds4f_mlx4_matvec(
+            (const uint32_t *)(const void *)(h->buf + h->w_off),
+            (const uint16_t *)(const void *)(h->buf + h->s_off),
+            bias, (int)V, (int)Hdec, state, logits);
     } else if (h->w_dtype == 1) {
         ds4f_i8_matvec(h->buf + h->w_off, scales,
                        (int)V, (int)H, SR, SC, state, logits);
@@ -244,6 +294,7 @@ int ds4f_embed_gather(const Ds4fEmbed *e, int tok, float *out) {
     long V = e->dims[0], H = e->dims[1];
     if (tok < 0 || tok >= V) return -1;
     size_t esz = e->dtype == 0 ? 4 : (e->dtype == 4 || e->dtype == 5) ? 2 : 1;
+    if (e->dtype == 6) esz = 4;          /* U32 packed words */
     const uint8_t *row = e->buf + (size_t)tok * H * esz;
     if (e->dtype == 0) {
         memcpy(out, row, (size_t)H * sizeof(float));
@@ -281,6 +332,33 @@ int ds4f_embed_gather(const Ds4fEmbed *e, int tok, float *out) {
     } else if (e->dtype == 5) {
         const uint16_t *r16 = (const uint16_t *)(const void *)row;
         for (int i = 0; i < (int)H; i++) out[i] = ds4f_f16_to_f32(r16[i]);
+    } else if (e->dtype == 6) {
+        /* MLX 4-bit embed: token row = U32 nibbles (H packed words ->
+         * decoded H*8), BF16 scale/bias per 64-group. scales/biases
+         * are [V x G] with G = decoded_cols/64. */
+        long Hdec = H * 8;
+        long G = Hdec / 64;
+        const uint32_t *w32 = (const uint32_t *)(const void *)row;
+        const uint16_t *scales = e->s_nbytes > 0
+            ? (const uint16_t *)(const void *)(e->buf + e->s_off)
+            : NULL;
+        const uint16_t *bias = e->b_nbytes > 0
+            ? (const uint16_t *)(const void *)(e->buf + e->b_off)
+            : NULL;
+        for (int i = 0; i < (int)Hdec; i++) {
+            int q = (int)((w32[i >> 3] >> (4 * (i & 7))) & 0xFu);
+            int g = i / 64;
+            float s = 1.0f, b = 0.0f;
+            if (scales) {
+                uint32_t sb = (uint32_t)scales[(size_t)tok * G + g] << 16;
+                memcpy(&s, &sb, 4);
+            }
+            if (bias) {
+                uint32_t bb = (uint32_t)bias[(size_t)tok * G + g] << 16;
+                memcpy(&b, &bb, 4);
+            }
+            out[i] = ((float)q - 8.0f) * s + b;
+        }
     } else {
         const uint16_t *r16 = (const uint16_t *)(const void *)row;
         for (int i = 0; i < (int)H; i++) {
