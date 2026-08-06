@@ -84,9 +84,14 @@ exit 0 (23 GB gate armed, never fired)
 - `src/moe.c`: `fmt`/`rel_b` fields, U32 dtype role, `.mlp.gate.weight`
   router matching, mlx4 dispatch in the expert chain
 - `src/main.c`: MLX router gate path with sibling scales/biases
-- still NOT correct inference: the expert chain is the DS-V4 sequential
-  w1->w2->w3 shape; Qwen3's gate||up->down parallel topology and the
-  silu activation are the next correctness block
+- `src/moe.c` (chain): Qwen3 parallel expert topology landed —
+  `silu(gate(x)) * up(x) -> down` (chain flag, manifest order
+  gate/up/down). Run: **3840 matvecs / 4.03B elements decoded**,
+  40/40 layers real routing, exit 0, gate armed
+- still NOT verified-correct inference: the attention path (10 full-GQA
+  + 30 linear-attention layers) and the final lm_head aren't wired to
+  the MLX format yet — the expert MLP is real, the attention half of
+  the forward is next
 
 ## Graceful stop (the guard)
 
