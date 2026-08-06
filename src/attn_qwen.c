@@ -185,14 +185,177 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     return 0;
 }
 
-/* Linear-attention step: Mamba2-class. Currently a graceful skip --
- * the recurrent state machinery (conv1d + A_log decay + selective
- * scan) is the next block. */
+/* ------------------------------------------------------------------ */
+/* Linear attention: Gated DeltaNet (Qwen3-Next class)                 */
+/* ------------------------------------------------------------------ */
+/*
+ * Per layer, per token:
+ *   qkv = in_proj_qkv(x)            [8192] = q(2048=16x128) k(2048) v(4096=32x128)
+ *   z   = in_proj_z(x)              [4096] = 32 value heads x 128
+ *   a   = in_proj_a(x), b = in_proj_b(x)   [32] per value head
+ *   conv1d over qkv (depthwise, kernel 4, channel 8192)
+ *   RMSNorm q and k (norm.weight, 128)
+ *   dt = softplus(dt_bias); decay = exp(-exp(A_log) * dt)   [32]
+ *   state_h = decay_h * state_h + b_h * outer(k_h, v_h)     (delta rule)
+ *   out_h   = state_h^T q_h                                  (readout)
+ *   o = concat(out_h) -> [4096]; gated by z: o *= silu(z)? (z-gate)
+ *   out_proj(o) -> [2048], residual add
+ *
+ * The conv needs the previous (kernel-1) qkv vectors; kept per layer
+ * in the state arena tail. GQA-style head sharing: 16 key heads serve
+ * 32 value heads (value head h uses key head h/2).
+ */
+#define Q3_CONV_K 4
+
 static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                        const uint8_t *tr, float *state, Ds4fKvCache *kv,
                        int token) {
-    (void)cfg; (void)tl; (void)L; (void)tr; (void)state; (void)kv; (void)token;
-    return 0;                     /* skip: MLP still runs this layer */
+    int pi = tl->q3_pqkv[L], ps = tl->q3_pqkvs[L], pb = tl->q3_pqkvb[L];
+    int zi = tl->q3_pz[L], zs = tl->q3_pzs[L], zb = tl->q3_pzb[L];
+    int ai = tl->q3_pa[L], as_ = tl->q3_pas[L], ab = tl->q3_pab[L];
+    int bi = tl->q3_pb[L], bs_ = tl->q3_pbs[L], bb = tl->q3_pbb[L];
+    int ci = tl->q3_conv[L];
+    int oi = tl->q3_opa[L], os_ = tl->q3_opas[L], ob = tl->q3_opab[L];
+    int ni = tl->q3_lnorm[L];
+    int ai_ = tl->q3_a_log[L], di = tl->q3_dt[L];
+    if (pi < 0 || zi < 0 || ai < 0 || bi < 0 || ci < 0 || oi < 0 ||
+        ni < 0 || ai_ < 0 || di < 0)
+        return 0;                    /* incomplete graph: skip */
+    int H = cfg->hidden;
+    int qkv_rows = (int)tl->t[pi].dims[0];      /* 8192 */
+    int z_rows = (int)tl->t[zi].dims[0];        /* 4096 */
+    int o_rows = (int)tl->t[oi].dims[0];        /* 2048 */
+    int cols = (int)tl->t[pi].dims[1] * 8;      /* decoded 2048 = H */
+    /* head geometry from the model config */
+    int k_heads = 16, v_heads = 32, kd = 128, vd = 128;
+    if (cfg->n_heads > 0) k_heads = cfg->n_heads;      /* 16 */
+    if (cfg->n_kv_heads > 0) v_heads = cfg->n_kv_heads * 16; /* 2x16=32 */
+    if (qkv_rows != k_heads * kd * 2 + v_heads * vd) {
+        fprintf(stderr, "qwen lin: L%d qkv %d != k %d*%d*2 + v %d*%d\n",
+                L, qkv_rows, k_heads, kd, v_heads, vd);
+        return -1;
+    }
+    if (z_rows != v_heads * vd || o_rows != H) return -1;
+    if (!kv || token < 0 || token >= kv->max_tokens) return 0;
+    if (!kv->lin_alloc)
+        if (ds4f_kv_lin_init(kv, v_heads, kd, vd) != 0) return -1;
+
+    float *buf = (float *)calloc(
+        (size_t)(qkv_rows + z_rows + o_rows + v_heads * vd +
+                 v_heads * kd + Q3_CONV_K * qkv_rows + 2 * H + 1),
+        sizeof(float));
+    if (!buf) return -1;
+    float *qkv = buf;
+    float *z = qkv + qkv_rows;
+    float *o = z + z_rows;
+    float *readout = o + o_rows;              /* v_heads*vd */
+    float *qk = readout + v_heads * vd;       /* k_heads*kd */
+    float *conv_ring = qk + k_heads * kd;     /* Q3_CONV_K * qkv_rows */
+
+    if (mlx4_proj(tl, pi, ps, pb, tr, qkv_rows, cols, state, qkv) != 0 ||
+        mlx4_proj(tl, zi, zs, zb, tr, z_rows, cols, state, z) != 0) {
+        free(buf);
+        return -1;
+    }
+    float a32[32], b32[32];
+    {
+        float tmp[32];
+        if (mlx4_proj(tl, ai, as_, ab, tr, 32, cols, state, tmp) != 0 ||
+            mlx4_proj(tl, bi, bs_, bb, tr, 32, cols, state, a32) != 0) {
+            free(buf);
+            return -1;
+        }
+        memcpy(b32, a32, sizeof b32);        /* b = second proj result */
+        memcpy(a32, tmp, sizeof a32);
+    }
+    /* conv1d: depthwise over qkv, kernel 4. Weight [8192, 4, 1] BF16,
+     * layout [channel][k][1]. Ring holds past Q3_CONV_K qkv vectors. */
+    {
+        const uint16_t *cw = (const uint16_t *)(const void *)(tr +
+                              tl->t[ci].off);
+        int base = (token % Q3_CONV_K) * qkv_rows;
+        memcpy(conv_ring + base, qkv, (size_t)qkv_rows * sizeof(float));
+        float *outq = qkv;                   /* in-place */
+        for (int ch = 0; ch < qkv_rows; ch++) {
+            float acc = 0.0f;
+            for (int k = 0; k < Q3_CONV_K; k++) {
+                int tpos = token - k;
+                if (tpos < 0) continue;
+                int slot = (tpos % Q3_CONV_K) * qkv_rows + ch;
+                float w = bf16_f(cw[(size_t)ch * Q3_CONV_K + k]);
+                acc += conv_ring[slot] * w;
+            }
+            outq[ch] = acc;
+        }
+    }
+    /* RMSNorm q (first k_heads*kd) and k (next k_heads*kd) */
+    {
+        const uint16_t *nw = (const uint16_t *)(const void *)(tr +
+                             tl->t[ni].off);
+        for (int h = 0; h < k_heads; h++) {
+            float *qh = qkv + (size_t)h * kd;
+            float *kh = qkv + (size_t)(k_heads * kd) + (size_t)h * kd;
+            rmsnorm(nw, kd, qh);
+            rmsnorm(nw, kd, kh);
+        }
+    }
+    /* decay: softplus(dt_bias) * exp(A_log), per value head */
+    float decay[32];
+    {
+        const float *Al = (const float *)(const void *)(tr + tl->t[ai_].off);
+        const uint16_t *dtb = (const uint16_t *)(const void *)(tr +
+                              tl->t[di].off);
+        for (int h = 0; h < v_heads; h++) {
+            float dt = bf16_f(dtb[h]);
+            float sp = dt > 0 ? dt + log1pf(expf(-dt)) : log1pf(expf(dt));
+            decay[h] = expf(-expf(Al[h]) * sp);
+        }
+    }
+    /* delta-rule state update + readout. state_h = [kd x vd], value
+     * head h uses key head h/2 (GQA 16->32). */
+    float *S = kv->lin + (size_t)L * v_heads * kd * vd;
+    memset(readout, 0, (size_t)v_heads * vd * sizeof(float));
+    for (int h = 0; h < v_heads; h++) {
+        int khh = h / 2;
+        const float *kh = qkv + (size_t)(k_heads * kd) + (size_t)khh * kd;
+        const float *vh = qkv + (size_t)(2 * k_heads * kd) +
+                          (size_t)h * vd;
+        float *Sh = S + (size_t)h * kd * vd;
+        float d = decay[h];
+        float beta = b32[h];
+        /* state = d * state + beta * outer(k, v) */
+        for (int i = 0; i < kd; i++) {
+            float *row = Sh + (size_t)i * vd;
+            float kk = kh[i];
+            for (int j = 0; j < vd; j++)
+                row[j] = d * row[j] + beta * kk * vh[j];
+        }
+        /* readout: out_h = state^T q_h (q of the key head) */
+        const float *qh = qkv + (size_t)khh * kd;
+        float *oh = readout + (size_t)h * vd;
+        for (int j = 0; j < vd; j++) {
+            float acc = 0.0f;
+            for (int i = 0; i < kd; i++)
+                acc += Sh[(size_t)i * vd + j] * qh[i];
+            oh[j] = acc;
+        }
+    }
+    /* z-gate: o = readout * silu(z) */
+    for (int i = 0; i < v_heads * vd; i++) {
+        float zv = z[i];
+        float sig = 1.0f / (1.0f + expf(-zv));
+        readout[i] *= zv * sig;
+    }
+    /* out_proj(readout) -> o, residual add */
+    if (mlx4_proj(tl, oi, os_, ob, tr, o_rows, v_heads * vd, readout, o)
+        != 0) {
+        free(buf);
+        return -1;
+    }
+    for (int i = 0; i < H; i++) state[i] += o[i];
+
+    free(buf);
+    return 0;
 }
 
 /* Dispatch: full-GQA layers (self_attn roles present) vs linear. */

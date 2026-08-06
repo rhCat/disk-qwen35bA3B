@@ -40,7 +40,21 @@ int ds4f_kv_init(Ds4fKvCache *c, int n_layers, int kvlat, int max_tokens) {
 void ds4f_kv_free(Ds4fKvCache *c) {
     if (!c) return;
     free(c->kv);
+    free(c->lin);
     memset(c, 0, sizeof *c);
+}
+
+int ds4f_kv_lin_init(Ds4fKvCache *c, int v_heads, int kd, int vd) {
+    if (!c || v_heads < 1 || kd < 1 || vd < 1) return -1;
+    if (c->lin_alloc) return 0;          /* already sized */
+    size_t n = (size_t)c->n_layers * v_heads * kd * vd;
+    c->lin = (float *)calloc(n, sizeof(float));
+    if (!c->lin) return -1;
+    c->lin_vh = v_heads;
+    c->lin_kd = kd;
+    c->lin_vd = vd;
+    c->lin_alloc = 1;
+    return 0;
 }
 
 /* E8M0 group-scale matvec wrapper: pulls SR/SC from the scale tensor.
