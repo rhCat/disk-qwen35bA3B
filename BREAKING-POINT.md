@@ -64,6 +64,30 @@ exit 0 (23 GB gate armed, never fired)
   the 23 GB graceful stop is the runtime backstop
 - `make test` 20/20 (19 inherited + memlimit gate)
 
+## Compute path LIVE (2026-08-06)
+
+The MLX 4-bit kernel + format dispatch landed and the engine now
+computes REAL Qwen3.5 expert matvecs from the disk pool:
+
+```
+router: real matvec on 40/40 layers      (mlx4 router gate drives selection)
+moe: 2560 matvecs, 2684354560 decoded elements
+GB read per token: 0.70  (trunk 631 MB, experts 2038 MB)
+exit 0 (23 GB gate armed, never fired)
+```
+
+- `tools/split-mlx-switchmlp.py` emits the engine's layout schema
+  (`fmt: 1`, `v_off/s_off/b_off`, decoded `[R, C]` dims) — 30720
+  tensor entries
+- `src/kernels.c`: `ds4f_mlx4_decode` / `ds4f_mlx4_matvec` (U32
+  nibbles, BF16 scale+bias per 64-group), fixture-gated (tests 12/13)
+- `src/moe.c`: `fmt`/`rel_b` fields, U32 dtype role, `.mlp.gate.weight`
+  router matching, mlx4 dispatch in the expert chain
+- `src/main.c`: MLX router gate path with sibling scales/biases
+- still NOT correct inference: the expert chain is the DS-V4 sequential
+  w1->w2->w3 shape; Qwen3's gate||up->down parallel topology and the
+  silu activation are the next correctness block
+
 ## Graceful stop (the guard)
 
 The engine stops cleanly BEFORE the OS OOM-kills it:
