@@ -142,7 +142,7 @@ def main():
                     # each; the engine's chain runs them in order so the
                     # proj triplet must be contiguous in slot order.
                     ent = {"layer": L, "expert": e,
-                           "shape": None, "fmt": 1,
+                           "shape": None, "fmt": 1, "chain": "qwen3",
                            "v_off": None, "s_off": None, "b_off": None,
                            "v_nbytes": None, "s_nbytes": None,
                            "b_nbytes": None, "name": proj}

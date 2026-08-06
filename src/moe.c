@@ -94,6 +94,13 @@ int ds4f_pool_layout_load(Ds4fPoolLayout *pl, const char *path,
             continue;
         Ds4fExpertLayout *el = &pl->exp[(size_t)L * pl->n_experts + X];
         if (el->n >= DS4F_MAX_TENSORS_PER_EXPERT) continue;
+        /* Qwen3 chain marker: set once from the first tensor entry */
+        if (el->n == 0) {
+            const JEntry *ch = json_get(e->child, e->nchild, "chain");
+            el->chain = (ch && ch->type == 1 && ch->str &&
+                         ch->str_end - ch->str == 5 &&
+                         !memcmp(ch->str, "qwen3", 5)) ? 1 : 0;
+        }
         Ds4fMoETensor *t = &el->t[el->n++];
         t->rank = shp->nchild;
         if (t->rank > 4) t->rank = 4;
@@ -433,6 +440,102 @@ static void *exp_run(void *arg) {
     if (!cur || !tmp) { free(cur); free(tmp); j->fail = 1; return NULL; }
     memcpy(cur, j->latent, (size_t)j->Lat * sizeof(float));
     long clen = j->Lat;
+    if (j->el->chain == 1) {
+        /* Qwen3 parallel expert: silu(gate(x)) * up(x) -> down.
+         * t[0]=gate_proj, t[1]=up_proj, t[2]=down_proj (manifest order).
+         * gate/up: [moe_inter x H]; down: [H x moe_inter]. The chain
+         * input is Lat floats (the residual/MLP input), H wide. */
+        const Ds4fMoETensor *g = &j->el->t[0];
+        const Ds4fMoETensor *u = &j->el->t[1];
+        const Ds4fMoETensor *d = &j->el->t[2];
+        if (g->rank == 2 && u->rank == 2 && d->rank == 2 &&
+            g->dims[1] == j->Lat && u->dims[1] == j->Lat &&
+            g->dims[0] == u->dims[0] && g->dims[0] <= j->D &&
+            d->dims[1] == g->dims[0] && d->dims[0] == j->Lat) {
+            long M = g->dims[0];
+            float *gx = tmp;            /* gate(x), M floats */
+            float *ux = cur;            /* up(x), M floats (reuse cur) */
+            float *chain = (float *)calloc((size_t)j->D, sizeof(float));
+            if (!chain) { free(cur); free(tmp); j->fail = 1; return NULL; }
+            if (g->fmt == 1) {
+                const uint16_t *gb = g->rel_b >= 0
+                    ? (const uint16_t *)(const void *)(j->slot + g->rel_b)
+                    : NULL;
+                const uint16_t *ub = u->rel_b >= 0
+                    ? (const uint16_t *)(const void *)(j->slot + u->rel_b)
+                    : NULL;
+                ds4f_mlx4_matvec(
+                    (const uint32_t *)(const void *)(j->slot + g->rel_v),
+                    (const uint16_t *)(const void *)(j->slot + g->rel_s),
+                    gb, (int)M, (int)j->Lat, cur, gx);
+                ds4f_mlx4_matvec(
+                    (const uint32_t *)(const void *)(j->slot + u->rel_v),
+                    (const uint16_t *)(const void *)(j->slot + u->rel_s),
+                    ub, (int)M, (int)j->Lat, cur, ux);
+            } else {
+                ds4f_mxfp4_matvec(j->slot + g->rel_v, j->slot + g->rel_s,
+                                  (int)M, (int)j->Lat, g->bsize, cur, gx,
+                                  j->scratch);
+                ds4f_mxfp4_matvec(j->slot + u->rel_v, j->slot + u->rel_s,
+                                  (int)M, (int)j->Lat, u->bsize, cur, ux,
+                                  j->scratch);
+            }
+            j->n_matvec += 2;
+            j->n_decode += 2 * M * j->Lat;
+            /* silu(gate(x)) * up(x) -> chain, M floats */
+            for (long i = 0; i < M; i++) {
+                float s = gx[i];
+                float sig = 1.0f / (1.0f + expf(-s));
+                chain[i] = s * sig * ux[i];
+            }
+            /* down(chain) -> cur (Lat floats) */
+            if (d->fmt == 1) {
+                const uint16_t *db = d->rel_b >= 0
+                    ? (const uint16_t *)(const void *)(j->slot + d->rel_b)
+                    : NULL;
+                ds4f_mlx4_matvec(
+                    (const uint32_t *)(const void *)(j->slot + d->rel_v),
+                    (const uint16_t *)(const void *)(j->slot + d->rel_s),
+                    db, (int)j->Lat, (int)M, chain, tmp);
+            } else {
+                ds4f_mxfp4_matvec(j->slot + d->rel_v, j->slot + d->rel_s,
+                                  (int)j->Lat, (int)M, d->bsize, chain, tmp,
+                                  j->scratch);
+            }
+            j->n_matvec++;
+            j->n_decode += j->Lat * M;
+            memcpy(cur, tmp, (size_t)j->Lat * sizeof(float));
+            clen = j->Lat;
+            free(chain);
+        } else {
+            /* shape mismatch: fall through to the sequential path so
+             * the run still completes (garbage, but not a crash) */
+            for (int ti = 0; ti < j->el->n; ti++) {
+                const Ds4fMoETensor *t = &j->el->t[ti];
+                if (t->rank != 2) continue;
+                long R = t->dims[0], C = t->dims[1];
+                if (C != clen || R > j->D) continue;
+                if (R * C > j->scratch_n) { j->fail = 1; break; }
+                if (t->fmt == 1) {
+                    const uint16_t *biases = t->rel_b >= 0
+                        ? (const uint16_t *)(const void *)(j->slot + t->rel_b)
+                        : NULL;
+                    ds4f_mlx4_matvec(
+                        (const uint32_t *)(const void *)(j->slot + t->rel_v),
+                        (const uint16_t *)(const void *)(j->slot + t->rel_s),
+                        biases, (int)R, (int)C, cur, tmp);
+                } else {
+                    ds4f_mxfp4_matvec(j->slot + t->rel_v, j->slot + t->rel_s,
+                                      (int)R, (int)C, t->bsize, cur, tmp,
+                                      j->scratch);
+                }
+                j->n_matvec++;
+                j->n_decode += R * C;
+                memcpy(cur, tmp, (size_t)R * sizeof(float));
+                clen = R;
+            }
+        }
+    } else {
     for (int ti = 0; ti < j->el->n; ti++) {
         const Ds4fMoETensor *t = &j->el->t[ti];
         if (t->rank != 2) continue;
@@ -456,6 +559,7 @@ static void *exp_run(void *arg) {
         j->n_decode += R * C;
         memcpy(cur, tmp, (size_t)R * sizeof(float));
         clen = R;
+    }
     }
     long ncopy = j->Lat < clen ? j->Lat : clen;
     memcpy(j->out, cur, (size_t)ncopy * sizeof(float));
