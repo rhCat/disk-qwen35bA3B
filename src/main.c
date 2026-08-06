@@ -61,6 +61,12 @@ static double now_s(void) {
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+/* name ends with suffix (NUL-terminated; mirrors moe.c's static) */
+static int name_ends(const char *name, const char *suffix) {
+    size_t nl = strlen(name), sl = strlen(suffix);
+    return nl >= sl && !memcmp(name + nl - sl, suffix, sl);
+}
+
 int main(int argc, char **argv) {
     fprintf(stderr, "ds4f build %s\n",
 #ifdef DS4F_GIT
@@ -541,7 +547,26 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                if (gt->dtype == 4)      /* BF16 */
+                if (gt->dtype == 5) {
+                    /* MLX 4-bit router gate: U32 nibbles + BF16 scales +
+                     * BF16 biases per group. Rows = experts, cols =
+                     * packed_cols * 8. Locate the sibling tensors. */
+                    const Ds4fTrunkTensor *gsc = NULL, *gbs = NULL;
+                    for (int qi = tl.t_off[L]; qi < tl.t_off[L + 1]; qi++) {
+                        if (name_ends(tl.t[qi].name, ".mlp.gate.scales"))
+                            gsc = &tl.t[qi];
+                        else if (name_ends(tl.t[qi].name, ".mlp.gate.biases"))
+                            gbs = &tl.t[qi];
+                    }
+                    long pc = gt->dims[1];
+                    ds4f_mlx4_matvec(
+                        (const uint32_t *)(const void *)(tr + gt->off),
+                        gsc ? (const uint16_t *)(const void *)(tr + gsc->off)
+                            : NULL,
+                        gbs ? (const uint16_t *)(const void *)(tr + gbs->off)
+                            : NULL,
+                        (int)gt->dims[0], (int)(pc * 8), rstate, scores);
+                } else if (gt->dtype == 4)      /* BF16 */
                     ds4f_bf16_matvec(
                         (const uint16_t *)(const void *)(tr + gt->off),
                         cfg.n_experts, cfg.hidden, rstate, gbias, scores);

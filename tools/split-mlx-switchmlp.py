@@ -130,12 +130,22 @@ def main():
         pf.write(struct.pack("<QQQ", expert_bytes, n_layers, E))
         manifest = {"format": "mlx4-split-v1", "n_layers": n_layers,
                     "n_experts": E, "expert_nbytes": expert_bytes,
-                    "experts": {}}
+                    "tensors": []}
         buf = bytearray(1 << 20)
         pos = 24
+        tcount = 0
         for L in layer_ids:
             for e in range(E):
+                slot_off = 24 + (L * E + e) * expert_bytes
                 for proj in proj_names:
+                    # values (weight), scales, biases -> one tensor entry
+                    # each; the engine's chain runs them in order so the
+                    # proj triplet must be contiguous in slot order.
+                    ent = {"layer": L, "expert": e,
+                           "shape": None, "fmt": 1,
+                           "v_off": None, "s_off": None, "b_off": None,
+                           "v_nbytes": None, "s_nbytes": None,
+                           "b_nbytes": None, "name": proj}
                     for suffix in ("weight", "scales", "biases"):
                         nm, fn, off, nb, dt, shp = tensor_meta(L, proj, suffix)
                         eb = nb // E
@@ -148,15 +158,28 @@ def main():
                                 raise RuntimeError("short read")
                             pf.write(got)
                             left -= len(got)
-                        if e == 0 and L == L0:
-                            manifest["experts"][f"{proj}.{suffix}"] = {
-                                "off": pos, "nbytes": eb, "dtype": dt,
-                                "slice_shape": shp[1:]}
+                        if suffix == "weight":
+                            # decoded dims: U32 packs 8 nibbles per word,
+                            # so cols = packed_cols * 8 (the engine's
+                            # matvec works on decoded [R, C]).
+                            ent["shape"] = [shp[1], shp[2] * 8]
+                            ent["v_off"] = pos
+                            ent["v_nbytes"] = eb
+                        elif suffix == "scales":
+                            ent["s_off"] = pos
+                            ent["s_nbytes"] = eb
+                        else:
+                            ent["b_off"] = pos
+                            ent["b_nbytes"] = eb
                         pos += eb
+                    manifest["tensors"].append(ent)
+                    tcount += 1
             if int(L) % 8 == 0:
                 print(f"  layer {L}/{n_layers-1} ...")
     for f in src_open.values():
         f.close()
+    print(f"  {tcount} tensor entries ({E} experts x {len(proj_names)} proj x "
+          f"{n_layers} layers)")
 
     # ---- config.json in engine format
     src_cfg = json.load(open(os.path.join(d, "config.json")))

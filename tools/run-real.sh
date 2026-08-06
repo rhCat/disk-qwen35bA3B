@@ -22,9 +22,11 @@ echo "=== real-scale run: trunk $TRUNK, pool $POOL, gen $GEN, limit ${LIMIT}GB =
 "$REPO_ROOT/ds4f" "$TRUNK" \
   --trunk "$TRUNK/trunk.bin" --offsets "$TRUNK/trunk.offsets" \
   --pool "$POOL/pool.bin" \
+  --layout-trunk "$TRUNK/trunk.json" \
+  --layout-pool "$POOL/manifest.json" \
   --gen "$GEN" --cache-gb 2 --pin-layers 4 \
   --mem-limit-gb "$LIMIT" \
   > /tmp/q35-run.log 2>&1
 rc=$?
 echo "exit: $rc"
-grep -E 'MEMORY LIMIT|config:|pool:|run report|resident|peak|GB/token|bytes|read|tokens/s|WARNING|dropped|maximum' /tmp/q35-run.log | tail -15
+grep -E 'MEMORY LIMIT|config:|pool:|trunk layout|pool layout|run report|resident|peak|GB/token|bytes|read|tokens/s|WARNING|dropped|maximum|matvec|moe:' /tmp/q35-run.log | tail -20

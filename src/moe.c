@@ -32,6 +32,7 @@ static int dtype_of(const char *s, size_t n) {
     if (n == 2 && !memcmp(s, "I8", 2)) return 1;
     if (n == 7 && !memcmp(s, "F8_E4M3", 7)) return 2;
     if (n == 4 && !memcmp(s, "BF16", 4)) return 4;
+    if (n == 3 && !memcmp(s, "U32", 3)) return 5;   /* MLX 4-bit packed */
     return 3;
 }
 
@@ -113,6 +114,22 @@ int ds4f_pool_layout_load(Ds4fPoolLayout *pl, const char *path,
         t->v_nbytes = vn->inum;
         t->s_nbytes = sn->inum;
         t->bsize = 32;             /* mxfp4-pool-v1 output format */
+        t->fmt = 0;
+        t->rel_b = -1;
+        {
+            /* optional mlx4 fields: fmt=1 selects the MLX 4-bit kernel,
+             * b_off/b_nbytes carry the per-group BF16 biases */
+            const JEntry *fm = json_get(e->child, e->nchild, "fmt");
+            if (fm && fm->type == 0 && fm->inum == 1) t->fmt = 1;
+            const JEntry *bo = json_get(e->child, e->nchild, "b_off");
+            const JEntry *bn = json_get(e->child, e->nchild, "b_nbytes");
+            if (bo && bn && bo->type == 0 && bn->type == 0) {
+                long rel_b = (long)(bo->inum - slot_off);
+                if (rel_b >= 0 && rel_b + bn->inum <= pl->expert_nbytes) {
+                    t->rel_b = rel_b;
+                }
+            }
+        }
         if (t->rel_v < 0 || t->rel_s < 0 ||
             t->rel_v + t->v_nbytes > pl->expert_nbytes ||
             t->rel_s + t->s_nbytes > pl->expert_nbytes) {
@@ -257,7 +274,18 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
              * exactly so attn.*.wgate.weight can never impersonate the
              * ffn router. */
             if (tt->name[0]) {
-                if (name_ends(tt->name, ".ffn.gate.weight") &&
+                /* Qwen3.5 roles: mlp.gate.weight = router, self_attn
+                 * q/k/v/o = attention, mlp.shared_expert.* = resident
+                 * shared MLP. These names are unique (no other tensor
+                 * ends with .mlp.gate.weight), so exact-leaf matching
+                 * stays unambiguous. */
+                if (name_ends(tt->name, ".mlp.gate.weight") &&
+                    (tt->dtype == 0 || tt->dtype == 4 || tt->dtype == 5)) {
+                    if (tl->gate[L] < 0) tl->gate[L] = k - 1;
+                } else if (name_ends(tt->name, ".mlp.gate.biases") &&
+                           tt->dtype == 0) {
+                    if (tl->gate_bias[L] < 0) tl->gate_bias[L] = k - 1;
+                } else if (name_ends(tt->name, ".ffn.gate.weight") &&
                     (tt->dtype == 0 || tt->dtype == 4)) {
                     if (tl->gate[L] < 0) tl->gate[L] = k - 1;
                 } else if (name_ends(tt->name, ".ffn.gate.bias") &&
@@ -411,9 +439,19 @@ static void *exp_run(void *arg) {
         long R = t->dims[0], C = t->dims[1];
         if (C != clen || R > j->D) continue;
         if (R * C > j->scratch_n) { j->fail = 1; break; }
-        ds4f_mxfp4_matvec(j->slot + t->rel_v, j->slot + t->rel_s,
-                          (int)R, (int)C, t->bsize, cur, tmp,
-                          j->scratch);
+        if (t->fmt == 1) {
+            const uint16_t *biases = t->rel_b >= 0
+                ? (const uint16_t *)(const void *)(j->slot + t->rel_b)
+                : NULL;
+            ds4f_mlx4_matvec(
+                (const uint32_t *)(const void *)(j->slot + t->rel_v),
+                (const uint16_t *)(const void *)(j->slot + t->rel_s),
+                biases, (int)R, (int)C, cur, tmp);
+        } else {
+            ds4f_mxfp4_matvec(j->slot + t->rel_v, j->slot + t->rel_s,
+                              (int)R, (int)C, t->bsize, cur, tmp,
+                              j->scratch);
+        }
         j->n_matvec++;
         j->n_decode += R * C;
         memcpy(cur, tmp, (size_t)R * sizeof(float));
