@@ -42,6 +42,28 @@ Measured (this Mac, 2026-08-06): **16.88 GB, 256 experts × 40 layers,
 1.69 MB per expert, topk 8, n_shared 1** — built without ever loading
 the model into RAM (streaming slices, ~few MB peak).
 
+`tools/build-trunk-mlx.py` builds the dense resident set the same way:
+**702 MB trunk (40 layers, 910 tensors) + 242.5 MB embed + 242.5 MB
+head** — ~1.2 GB of resident weights before cache/KV.
+
+## Measured loading run (2026-08-06, M4 Pro, real pool + trunk)
+
+```
+config: 40 layers x 256 experts, topk 8, expert 1769472 bytes
+trunk:  pin 4/40 layers, ring 2 x 19317184 bytes
+cache:  1130 slots (1907 MB), 4 fetch threads
+GB read per token: 0.70  (trunk 631 MB, experts 2053 MB)
+cache: 1280 requests, 63 hits (4.9%), 0 dropped
+exit 0 (23 GB gate armed, never fired)
+```
+
+- **0.70 GB read per token** from the 16.88 GB pool + trunk — the pool
+  is streamed, never resident
+- resident **plan 2.2 GB** — inside the 3-4 GB contract
+- memory plan refused at >95% available (25.8 GB have / 2.2 GB need);
+  the 23 GB graceful stop is the runtime backstop
+- `make test` 20/20 (19 inherited + memlimit gate)
+
 ## Graceful stop (the guard)
 
 The engine stops cleanly BEFORE the OS OOM-kills it:
