@@ -1,0 +1,19 @@
+# MLX serving path — Qwen3.5-35B-A3B on Apple Silicon
+#
+# The quick path: run the model resident on the Mac via MLX (Metal),
+# without the disk-streaming engine. Reproducible env in .venv/ (created
+# by setup-mlx.sh), model pulled to ~/.cache/huggingface by mlx_lm.
+#
+# Model: mlx-community/Qwen3.5-35B-A3B-4bit  (~20.4 GB on disk)
+#   - 4-bit MLX quant of Qwen3.5-35B-A3B (35B total / ~3B active)
+#   - hybrid linear/GQA attention, 256 experts top-8
+#   - FITS: M4 Pro 24 GB unified ONLY with everything else closed
+#     (20.4 GB weights + macOS + KV + activations = swap line)
+#
+# Engine path (the repo's purpose): see README — disk-streaming C99,
+# NVFP4 pool (25.4 GB) + ~4 GB resident. Not yet implemented.
+
+mlx-lm>=0.24
+mlx>=0.24
+httpx>=0.27
+typing-extensions>=4.1.0

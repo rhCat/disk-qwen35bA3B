@@ -8,3 +8,5 @@ bench-kernels
 fixture/
 *.o
 *.dSYM/
+.venv/
+*.log
