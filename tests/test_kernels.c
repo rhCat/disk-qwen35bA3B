@@ -354,5 +354,95 @@ int main(void) {
         printf("PASS test 11 (f8 simd == scalar on edge bytes)\n");
     }
 
+    /* 12: MLX 4-bit decode exactness on a hand-built known vector.
+     * One U32 = 8 nibbles, low nibble first; one BF16 scale+bias per
+     * 64 elements. element = (q - 8) * scale + bias. */
+    {
+        uint32_t vals[8];                 /* 64 elements = 1 group */
+        uint16_t scales[1], biases[1];
+        for (int i = 0; i < 8; i++) {
+            uint32_t v = 0;
+            for (int j = 0; j < 8; j++)
+                v |= (uint32_t)((i * 8 + j) % 16) << (4 * j);
+            vals[i] = v;
+        }
+        scales[0] = 0x3F80;               /* bf16 1.0 */
+        biases[0] = 0x0000;               /* bf16 0.0 */
+        float out[64];
+        ds4f_mlx4_decode(vals, scales, biases, 64, out);
+        int ok = 1;
+        for (int k = 0; k < 64; k++) {
+            int q = k % 16;
+            float want = (float)q - 8.0f;
+            if (fabsf(out[k] - want) > 1e-6f) { ok = 0; break; }
+        }
+        if (!ok) { printf("FAIL test 12 (mlx4 decode known)\n"); return 1; }
+        /* group boundary: element 64 uses scale[1] */
+        uint32_t v2[9] = {0};
+        uint16_t sc2[2] = {0x3F80, 0x4000};   /* 1.0, 2.0 */
+        uint16_t bi2[2] = {0, 0};
+        v2[8] = 0x00000005;               /* element 64 = word 8, nibble 0 = 5 */
+        float out2[72];
+        ds4f_mlx4_decode(v2, sc2, bi2, 72, out2);
+        if (fabsf(out2[64] - (5.0f - 8.0f) * 2.0f) > 1e-6f) {
+            printf("FAIL test 12b (mlx4 group boundary)\n"); return 1;
+        }
+        printf("PASS test 12 (mlx4 decode known + group boundary)\n");
+    }
+
+    /* 13: MLX 4-bit matvec vs naive dequant+dot, general R x C. */
+    {
+        int R = 8, C = 200;               /* C % 8 == 0, not 64-div */
+        int n = R * C;
+        int nw = (n + 7) / 8;
+        int ng = (n + 63) / 64;
+        uint32_t *vals = (uint32_t *)calloc((size_t)nw, sizeof(uint32_t));
+        uint16_t *scales = (uint16_t *)calloc((size_t)ng, sizeof(uint16_t));
+        uint16_t *biases = (uint16_t *)calloc((size_t)ng, sizeof(uint16_t));
+        float *x = (float *)malloc((size_t)C * sizeof(float));
+        float *y1 = (float *)malloc((size_t)R * sizeof(float));
+        float *y2 = (float *)malloc((size_t)R * sizeof(float));
+        srand(13);
+        for (int i = 0; i < n; i++) {
+            int q = rand() % 16;
+            vals[i >> 3] |= (uint32_t)q << (4 * (i & 7));
+        }
+        for (int g = 0; g < ng; g++) {
+            uint32_t s = (uint32_t)(rand() % 20000);   /* small bf16 bits */
+            uint32_t b = (uint32_t)(rand() % 20000);
+            scales[g] = (uint16_t)s;
+            biases[g] = (uint16_t)b;
+        }
+        for (int c = 0; c < C; c++) x[c] = (float)(rand() % 200) / 100.0f - 1.0f;
+        ds4f_mlx4_matvec(vals, scales, biases, R, C, x, y1);
+        /* naive: bf16 = top 16 bits of fp32; dequant each element, dot */
+        for (int r = 0; r < R; r++) {
+            float acc = 0.0f;
+            for (int c = 0; c < C; c++) {
+                int k = r * C + c;
+                int q = (int)((vals[k >> 3] >> (4 * (k & 7))) & 0xFu);
+                int g = k / 64;
+                uint32_t sb = (uint32_t)scales[g] << 16;
+                uint32_t bb = (uint32_t)biases[g] << 16;
+                float s, b;
+                memcpy(&s, &sb, 4);
+                memcpy(&b, &bb, 4);
+                acc += (((float)q - 8.0f) * s + b) * x[c];
+            }
+            y2[r] = acc;
+        }
+        int ok = 1;
+        for (int r = 0; r < R; r++)
+            if (fabsf(y1[r] - y2[r]) > 1e-3f * (1.0f + fabsf(y2[r]))) ok = 0;
+        if (!ok) {
+            printf("FAIL test 13 (mlx4 matvec vs naive)\n");
+            for (int r = 0; r < R; r++)
+                printf("  r%d kernel %.6f naive %.6f\n", r, y1[r], y2[r]);
+            return 1;
+        }
+        free(vals); free(scales); free(biases); free(x); free(y1); free(y2);
+        printf("PASS test 13 (mlx4 matvec vs naive)\n");
+    }
+
     return 0;
 }

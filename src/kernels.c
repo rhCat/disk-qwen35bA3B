@@ -92,6 +92,51 @@ void ds4f_bf16_matvec(const uint16_t *W, int R, int C, const float *x,
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* MLX 4-bit (Qwen3.5-35B-A3B) -- scalar reference                     */
+/* ------------------------------------------------------------------ */
+/*
+ * Packing (verified against the real repo, 2026-08-06):
+ *   values  U32, 8 nibbles per word, low nibble first:
+ *           elem(k) = (v[k/8] >> (4*(k%8))) & 0xF
+ *   scales  BF16, one per 64 elements, row-major group index
+ *   biases  BF16, same layout as scales
+ *   element = (q - 8) * scale[g] + bias[g], g = k / 64
+ */
+
+void ds4f_mlx4_decode(const uint32_t *vals, const uint16_t *scales,
+                      const uint16_t *biases, int n, float *out) {
+    for (int k = 0; k < n; k++) {
+        int q = (int)((vals[k >> 3] >> (4 * (k & 7))) & 0xFu);
+        int g = k / DS4F_MLX4_GROUP;
+        float s = bf16_to_f32(scales[g]);
+        float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
+        out[k] = ((float)q - 8.0f) * s + b;
+    }
+}
+
+void ds4f_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
+                      const uint16_t *biases, int R, int C,
+                      const float *x, float *y) {
+    /* Row-major packed: row r starts at word (r*C)/8, with the row
+     * aligned to a word boundary only when C % 8 == 0. The MLX
+     * switch_mlp rows are 2048 wide (C % 8 == 0) but the kernel must
+     * handle general C: iterate elements and track the group from the
+     * absolute element index so scales/biases stay correct. */
+    for (int r = 0; r < R; r++) {
+        float acc = 0.0f;
+        for (int c = 0; c < C; c++) {
+            long k = (long)r * C + c;
+            int q = (int)((vals[k >> 3] >> (4 * (int)(k & 7))) & 0xFu);
+            int g = (int)(k / DS4F_MLX4_GROUP);
+            float s = bf16_to_f32(scales[g]);
+            float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
+            acc += (((float)q - 8.0f) * s + b) * x[c];
+        }
+        y[r] = acc;
+    }
+}
+
 /* fp8_e4m3fn decode table (issue #6); e=0 subnormal-ish, e=15 clamp. */
 static float fp8_lut[256];
 static int  fp8_lut_ready = 0;
