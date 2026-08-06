@@ -88,10 +88,16 @@ exit 0 (23 GB gate armed, never fired)
   `silu(gate(x)) * up(x) -> down` (chain flag, manifest order
   gate/up/down). Run: **3840 matvecs / 4.03B elements decoded**,
   40/40 layers real routing, exit 0, gate armed
-- still NOT verified-correct inference: the attention path (10 full-GQA
-  + 30 linear-attention layers) and the final lm_head aren't wired to
-  the MLX format yet — the expert MLP is real, the attention half of
-  the forward is next
+- `src/attn_qwen.c` (GQA): full-GQA layers live — mlx4 q/k/v/o
+  projections (packed-col x8 decode), RMSNorm q/k, 16-head attention
+  over 2 kv-heads, o_proj residual add. Real effect measured:
+  **bytes/token 0.70 -> 0.43 GB, cache hits 5.9% -> 52.8%** (10
+  attention layers now compute from the resident trunk; real router
+  scores stabilize expert selection). exit 0
+- remaining: the 30 linear-attention layers (Mamba2-class: conv1d +
+  A_log decay + selective scan) are still gracefully skipped, and the
+  final lm_head isn't wired — the GQA half of attention is real, the
+  linear half + head are next
 
 ## Graceful stop (the guard)
 
