@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+build/
+ds4f
+pack-trunk
+make-fixture
+bench-kernels
+fixture/
+*.o
+*.dSYM/
