@@ -10,6 +10,15 @@ BIN_DIR="$REPO_ROOT/$VD/bin"
 # See run-mlx.sh: the agent's PYTHONPATH shadows this venv's numpy.
 unset PYTHONPATH
 
+# See run-mlx.sh: an active conda env hijacks subprocess resolution.
+if [ -n "${CONDA_DEFAULT_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; then
+  export PATH="$(printf '%s' "$PATH" | tr ':' '\n' \
+    | grep -v -E '/(miniconda3|miniforge3|anaconda3|mambaforge|conda)/' \
+    | paste -sd: -)"
+  unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_SHLVL CONDA_PROMPT_MODIFIER \
+        CONDA_EXE CONDA_PYTHON_EXE 2>/dev/null || true
+fi
+
 MODEL="${MLX_MODEL:-$HOME/.cache/huggingface/mlx-qwen35-a3b-4bit}"
 LOG="$HOME/mlx-qwen35.log"
 CMD="${1:-status}"

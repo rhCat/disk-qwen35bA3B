@@ -19,6 +19,18 @@ MODEL="${MLX_MODEL:-$HOME/.cache/huggingface/mlx-qwen35-a3b-4bit}"
 # venv's numpy/mlx (wrong python-version ABI -> import failure).
 unset PYTHONPATH
 
+# An active conda env (CONDA_DEFAULT_ENV, e.g. KHorizon) puts conda's
+# bin dirs first on PATH and its python/conda shims hijack subprocess
+# resolution (git/xet/conda calls from huggingface_hub). Leave conda
+# entirely: strip its dirs from PATH and drop its env vars.
+if [ -n "${CONDA_DEFAULT_ENV:-}" ] || [ -n "${CONDA_PREFIX:-}" ]; then
+  export PATH="$(printf '%s' "$PATH" | tr ':' '\n' \
+    | grep -v -E '/(miniconda3|miniforge3|anaconda3|mambaforge|conda)/' \
+    | paste -sd: -)"
+  unset CONDA_DEFAULT_ENV CONDA_PREFIX CONDA_SHLVL CONDA_PROMPT_MODIFIER \
+        CONDA_EXE CONDA_PYTHON_EXE 2>/dev/null || true
+fi
+
 case "${1:-}" in
   --diag)
     echo "PYTHONPATH inherited: ${PYTHONPATH:-<unset>}"
@@ -45,8 +57,18 @@ EOF
     "$BIN_DIR/pip" install --quiet -r "$REPO_ROOT/serving/requirements.txt" 2>&1 | tail -1
     "$PY" -c "import numpy, httpx, tqdm; print('numpy', numpy.__version__, '| httpx', httpx.__version__, '| tqdm OK')" ;;
   --pull)
-    "$PY" -m huggingface_hub.commands.huggingface_cli download \
-      mlx-community/Qwen3.5-35B-A3B-4bit --local-dir "$MODEL" ;;
+    "$PY" - "$MODEL" <<'EOF'
+import os, sys
+from huggingface_hub import snapshot_download
+dest = sys.argv[1]
+print("pulling mlx-community/Qwen3.5-35B-A3B-4bit ->", dest)
+p = snapshot_download(
+    repo_id="mlx-community/Qwen3.5-35B-A3B-4bit",
+    local_dir=dest,
+)
+print("done:", p)
+EOF
+    df -h / | tail -1 ;;
   --verify)
     "$PY" - <<'EOF'
 import mlx.core as mx
