@@ -125,6 +125,32 @@ int main(int argc, char **argv) {
     printf("bf16    (%dx%d)   : scalar %.2f s, SIMD %.2f s (%.1fx)\n",
            Br, Bc, bbf, bsi, bbf / bsi);
 
+    /* MLX 4-bit: expert-shaped 512 x 2048, real packing */
+    {
+        int Rm = 512, Cm = 2048;
+        uint32_t *mv4 = (uint32_t *)malloc((size_t)(Rm * Cm / 8) * 4);
+        uint16_t *ms4 = (uint16_t *)malloc((size_t)(Rm * Cm / 64) * 2);
+        uint16_t *mb4 = (uint16_t *)malloc((size_t)(Rm * Cm / 64) * 2);
+        for (int i = 0; i < Rm * Cm / 8; i++)
+            mv4[i] = (uint32_t)(((i * 7) % 16) * 0x11111111u);
+        for (int i = 0; i < Rm * Cm / 64; i++) {
+            ms4[i] = 0x3F80;             /* 1.0 */
+            mb4[i] = 0x0000;
+        }
+        float *mx = (float *)malloc((size_t)Cm * sizeof(float));
+        float *my = (float *)malloc((size_t)Rm * sizeof(float));
+        for (int c = 0; c < Cm; c++) mx[c] = (float)((c % 11) - 5) * 0.1f;
+        double t0m = now_s();
+        for (int rp = 0; rp < 200; rp++)
+            ds4f_mlx4_matvec(mv4, ms4, mb4, Rm, Cm, mx, my);
+        double tm = (now_s() - t0m) / 200.0;
+        printf("mlx4    (%dx%d)   : %.2f ms/matvec, %.2f GFLOP/s "
+               "(%.0fM elems/s)\n", Rm, Cm, tm * 1000.0,
+               (double)Rm * Cm * 2.0 / 1e9 / tm,
+               (double)Rm * Cm / 1e6 / tm);
+        free(mv4); free(ms4); free(mb4); free(mx); free(my);
+    }
+
     /* head-shaped: 4096 x 4096 I8 (issue #6 step 4) */
     {
         int Hr = 4096, Hc = 4096;

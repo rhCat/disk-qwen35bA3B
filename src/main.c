@@ -433,6 +433,12 @@ int main(int argc, char **argv) {
 
     double t0 = now_s();
     for (int t = 0; t < gen; t++) {
+        if (getenv("DS4F_TIME_LAYERS")) {
+            static double tL0 = 0.0;
+            if (t == 0) tL0 = now_s();
+            fprintf(stderr, "[toktime] t=%d start %.3fs\n", t,
+                    now_s() - t0);
+        }
         /* graceful memory limit: check peak RSS each token. On breach
          * stop cleanly with exit 3 (memory limit) -- never let the OS
          * OOM-kill mid-stream, and never mask it as a normal run. */
@@ -463,6 +469,9 @@ int main(int argc, char **argv) {
                        (size_t)cfg.hidden * sizeof(float));
         }
         for (int L = 0; L < cfg.n_layers; L++) {
+            if (getenv("DS4F_TIME_LAYERS") && t == 0 &&
+                (L % 4 == 0 || L == cfg.n_layers - 1))
+                fprintf(stderr, "[L] t0 L%d at %.3fs\n", L, now_s() - t0);
             if (moe_mode && t == 0 && L < 3)
                 fprintf(stderr, "moe: token 0 layer %d\n", L);
             const uint8_t *tr = ds4f_trunk_bind(&trunk, L);

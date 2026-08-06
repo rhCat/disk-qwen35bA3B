@@ -3,6 +3,8 @@
 #include "ds4f/simd.h"
 
 #include <math.h>
+#include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int g_simd = 1;
@@ -106,32 +108,98 @@ void ds4f_bf16_matvec(const uint16_t *W, int R, int C, const float *x,
 
 void ds4f_mlx4_decode(const uint32_t *vals, const uint16_t *scales,
                       const uint16_t *biases, int n, float *out) {
+    float lut[16];
+    long gcur = -1;
     for (int k = 0; k < n; k++) {
-        int q = (int)((vals[k >> 3] >> (4 * (k & 7))) & 0xFu);
         int g = k / DS4F_MLX4_GROUP;
-        float s = bf16_to_f32(scales[g]);
-        float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
-        out[k] = ((float)q - 8.0f) * s + b;
+        if (g != gcur) {
+            gcur = g;
+            float s = bf16_to_f32(scales[g]);
+            float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
+            for (int q = 0; q < 16; q++)
+                lut[q] = ((float)q - 8.0f) * s + b;
+        }
+        int q = (int)((vals[k >> 3] >> (4 * (k & 7))) & 0xFu);
+        out[k] = lut[q];
     }
+}
+
+/* row-partitioned mlx4 matvec worker (large matrices: expert MLPs,
+ * the 248320-row head) */
+typedef struct {
+    const uint32_t *vals;
+    const uint16_t *scales, *biases;
+    int R, C, r0, r1;
+    const float *x;
+    float *y;
+} Mlx4RowJob;
+
+static void *mlx4_row_worker(void *arg) {
+    Mlx4RowJob *j = (Mlx4RowJob *)arg;
+    ds4f_simd_mlx4_matvec(j->vals, j->scales, j->biases, j->R, j->C,
+                          j->x, j->y, j->r0, j->r1);
+    return NULL;
 }
 
 void ds4f_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
                       const uint16_t *biases, int R, int C,
                       const float *x, float *y) {
-    /* Row-major packed: row r starts at word (r*C)/8, with the row
-     * aligned to a word boundary only when C % 8 == 0. The MLX
-     * switch_mlp rows are 2048 wide (C % 8 == 0) but the kernel must
-     * handle general C: iterate elements and track the group from the
-     * absolute element index so scales/biases stay correct. */
+    /* SIMD fast path (NEON/AVX2) when the layout permits: C % 8 == 0
+     * (word-aligned rows). Large matrices (the expert MLPs and the
+     * 248320-row head) row-partition across worker threads. */
+    if (ds4f_kernels_simd() && (C % 8) == 0 && (C % DS4F_MLX4_GROUP) == 0) {
+        int nth = 1;
+        if (R >= 8192) {        /* only the lm_head (248320 rows) */
+            nth = 8;
+            const char *env = getenv("DS4F_ATTN_THREADS");
+            if (env) {
+                int v = atoi(env);
+                if (v >= 1 && v <= 32) nth = v;
+            }
+        }
+        if (nth > 1 && nth <= 16 && R >= 8192) {
+            /* stack-local jobs: this function is called concurrently
+             * by the 8 expert worker threads, so NO static scratch */
+            pthread_t th[16];
+            Mlx4RowJob job[16];
+            int chunk = (R + nth - 1) / nth;
+            int nspawn = 0;
+            for (int t = 0; t < nth; t++) {
+                int r0 = t * chunk;
+                int r1 = (t + 1) * chunk < R ? (t + 1) * chunk : R;
+                if (r0 >= R) continue;
+                job[t].vals = vals; job[t].scales = scales;
+                job[t].biases = biases; job[t].R = R; job[t].C = C;
+                job[t].x = x; job[t].y = y;
+                job[t].r0 = r0; job[t].r1 = r1;
+                pthread_create(&th[t], NULL, mlx4_row_worker, &job[t]);
+                nspawn++;
+            }
+            for (int t = 0; t < nspawn; t++)
+                pthread_join(th[t], NULL);
+            return;
+        }
+        ds4f_simd_mlx4_matvec(vals, scales, biases, R, C, x, y, 0, R);
+        return;
+    }
+    /* scalar fallback (LUT per group) */
+    float lut[16];
+    long gcur = -1;
     for (int r = 0; r < R; r++) {
         float acc = 0.0f;
+        const float *xr = x;
         for (int c = 0; c < C; c++) {
             long k = (long)r * C + c;
+            long g = k / DS4F_MLX4_GROUP;
+            if (g != gcur) {
+                gcur = g;
+                float s = bf16_to_f32(scales[g]);
+                float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
+                for (int q = 0; q < 16; q++)
+                    lut[q] = ((float)q - 8.0f) * s + b;
+            }
             int q = (int)((vals[k >> 3] >> (4 * (int)(k & 7))) & 0xFu);
-            int g = (int)(k / DS4F_MLX4_GROUP);
-            float s = bf16_to_f32(scales[g]);
-            float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
-            acc += (((float)q - 8.0f) * s + b) * x[c];
+            acc += lut[q] * xr[c];
         }
         y[r] = acc;
     }

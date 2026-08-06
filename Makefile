@@ -1,12 +1,13 @@
 CC      ?= cc
-# macOS (Apple clang) defaults to -O0: at -O1/-O2 this code hits a
-# clang codegen issue (~15-70% run-to-run divergence / SIGBUS / mfm
-# traps on some heap layouts; UBSan-clean, lldb-irreproducible, Linux
-# gcc -O2 clean). -O0 is 100% deterministic on both paths -- the Mac
-# is the dev/test box, the deployment target (acer/DGX, Linux) builds
-# -O2. Override with make CFLAGS="-std=c99 -O2 -Wall -Wextra -pthread".
+# macOS default -O2: the old -O0-on-Darwin rule existed for a clang
+# codegen divergence in the DS-V4 fixture era, but the current gate
+# (including e2e_text's byte-identical determinism check) passes at
+# -O2, and the real Qwen3.5 model measured 9.14 s/token at -O0 vs
+# 0.26 s/token at -O2 (35x). If the divergence ever reappears, the
+# -O0 override is one flag away:
+#   make CFLAGS="-std=c99 -O0 -Wall -Wextra -pthread"
 ifeq ($(shell uname),Darwin)
-CFLAGS  ?= -std=c99 -O0 -Wall -Wextra -pthread
+CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -pthread
 else
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -pthread
 endif

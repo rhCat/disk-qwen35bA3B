@@ -59,14 +59,12 @@ int ds4f_head_load(Ds4fHead *h, const char *json_path) {
     const JEntry *s = json_get(doc->root, doc->nroot, "scale");
     if (!bin || bin->type != 1) { json_free(doc); free(js); return -1; }
     /* weight layout: nested object {off,nbytes,dtype,shape} (MLX
-     * triplet) or flat top-level keys (legacy). Resolve to a common
-     * view: parent = the object holding off/nbytes/dtype. */
-    const JEntry *wobj = (w && w->type == 2) ? w : doc->root;
-    int wflat = (w && w->type == 2) ? 0 : 1;
+     * triplet) or flat top-level keys (legacy). */
+    int w_nested = (w && w->type == 2);
     /* json_get takes the CHILD ARRAY: nested objects use w->child,
      * flat layout uses doc->root itself */
-    const JEntry *warr = (w && w->type == 2) ? w->child : doc->root;
-    int wcnt = (w && w->type == 2) ? w->nchild : doc->nroot;
+    const JEntry *warr = w_nested ? w->child : doc->root;
+    int wcnt = w_nested ? w->nchild : doc->nroot;
     /* scale is OPTIONAL (a checkpoint may keep the head unquantized);
      * null/absent means no scales -> 1.0 everywhere */
     if (s && s->type == 2 && s->child) {
@@ -163,7 +161,6 @@ int ds4f_embed_load(Ds4fEmbed *e, const char *json_path) {
         json_free(doc); free(js); return -1;
     }
     int w_nested = (w && w->type == 2);
-    const JEntry *wobj = w_nested ? w : doc->root;
     /* json_get takes the CHILD ARRAY: nested objects use w->child,
      * flat layout uses doc->root itself */
     const JEntry *warr = w_nested ? w->child : doc->root;
