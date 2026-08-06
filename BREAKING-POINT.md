@@ -102,6 +102,16 @@ exit 0 (23 GB gate armed, never fired)
 - remaining: the final lm_head (MLX 4-bit) isn't wired — all 40
   layers of attention + MoE are real, the head is the last piece
   before tokens come out
+- **PERF (2026-08-06): 9.14 -> 0.21 s/token (43x).** Root cause of
+  the original slowness: the engine built at -O0 (the Darwin default
+  from the DS-V4 fixture era) AND the mlx4 kernel was scalar. Fixes:
+  NEON/AVX2 two-pass mlx4 matvec (vectorized decode to scratch +
+  8-accumulator FMA, **12.6 GFLOP/s / 6140M elems/s** vs 0.18 scalar),
+  SIMD only when C%64==0 (group-boundary correctness; fixtures fall
+  back to the LUT scalar path), malloc'd scratch row (per-row alloca
+  SIGBUS'd in the 8-thread expert path), Makefile -O2 on Darwin (the
+  full gate incl. e2e_text determinism passes at -O2). Real-model run:
+  **0.21 s/token, PEAK RSS 2.28 GB, exit 0**
 
 ## Graceful stop (the guard)
 
