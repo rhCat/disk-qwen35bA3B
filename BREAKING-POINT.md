@@ -94,10 +94,14 @@ exit 0 (23 GB gate armed, never fired)
   **bytes/token 0.70 -> 0.43 GB, cache hits 5.9% -> 52.8%** (10
   attention layers now compute from the resident trunk; real router
   scores stabilize expert selection). exit 0
-- remaining: the 30 linear-attention layers (Mamba2-class: conv1d +
-  A_log decay + selective scan) are still gracefully skipped, and the
-  final lm_head isn't wired — the GQA half of attention is real, the
-  linear half + head are next
+- `src/attn_qwen.c` (linear): Gated DeltaNet LIVE — conv1d (kernel-4
+  ring) + RMSNorm q/k + softplus(dt)*exp(A_log) decay + delta-rule
+  state (kd x vd per value head, GQA 16->32) + readout + silu(z) gate
+  + out_proj. **bytes/token 0.43 -> 0.32 GB, cache hits 52.8% ->
+  72.6%** (30 linear layers compute from the resident trunk). exit 0
+- remaining: the final lm_head (MLX 4-bit) isn't wired — all 40
+  layers of attention + MoE are real, the head is the last piece
+  before tokens come out
 
 ## Graceful stop (the guard)
 
