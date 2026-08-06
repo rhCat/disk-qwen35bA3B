@@ -35,6 +35,7 @@ bench-kernels: tools/bench-kernels.c $(SRC) $(HDR)
 
 test: all
 	./tests/run_tests.sh
+	bash tools/test-memlimit.sh
 
 # the disk/cpu loading experiment (A3B-shaped fixture, footprint report)
 FIXDIR ?= /tmp/fix35

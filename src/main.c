@@ -2,8 +2,9 @@
  * then the decode loop: bind trunk layer, route, fetch experts, compute
  * sink, record trace. Run report quotes measured peak RSS, not the plan.
  *
- * Exit codes: 0 ok; 1 config/usage; 2 I/O; 4 completed with dropped
- * experts (silent numerical corruption must not exit 0). */
+ * Exit codes: 0 ok; 1 config/usage; 2 I/O; 3 memory limit
+ * (graceful stop); 4 completed with dropped experts (silent numerical
+ * corruption must not exit 0). */
 #include "ds4f/ds4f.h"
 #include "ds4f/kernels.h"
 #include "ds4f/moe.h"
@@ -41,6 +42,8 @@ static void usage(const char *argv0) {
         "  --pin-layers N      explicit pinned trunk prefix    (default auto)\n"
         "  --nring N           trunk ring slots, >= 2          (default 2)\n"
         "  --gen N             tokens to generate              (default 4)\n"
+        "  --mem-limit-gb X    graceful stop when peak RSS hits X GB\n"
+        "                      (default 23; 0 = no limit)\n"
         "  --prompt S          seed string for hidden state    (default \"ds4f\")\n"
         "  --locality F        router popularity boost, 0..1   (default 0)\n"
         "  --trace FILE        write (layer,expert) request log\n"
@@ -72,6 +75,7 @@ int main(int argc, char **argv) {
     const char *head_path = NULL, *embed_path = NULL, *prompt_ids = NULL;
     const char *tok_path = NULL, *text_arg = NULL;
     double cache_gb = 8.0, trunk_gb = 4.0, locality = 0.0;
+    double mem_limit_gb = 23.0;
     int pin_layers = -1, nring = 2, gen = 4, threads = 4, refuse = 1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--preset")) {
@@ -84,6 +88,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--pin-layers") && i + 1 < argc) pin_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--nring") && i + 1 < argc) nring = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--gen") && i + 1 < argc) gen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--mem-limit-gb") && i + 1 < argc)
+            mem_limit_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--prompt") && i + 1 < argc) prompt = argv[++i];
         else if (!strcmp(argv[i], "--locality") && i + 1 < argc) locality = atof(argv[++i]);
         else if (!strcmp(argv[i], "--trace") && i + 1 < argc) trace_path = argv[++i];
@@ -409,6 +415,29 @@ int main(int argc, char **argv) {
 
     double t0 = now_s();
     for (int t = 0; t < gen; t++) {
+        /* graceful memory limit: check peak RSS each token. On breach
+         * stop cleanly with exit 3 (memory limit) -- never let the OS
+         * OOM-kill mid-stream, and never mask it as a normal run. */
+        if (mem_limit_gb > 0.0) {
+            double rss_gb = (double)ds4f_peak_rss() / 1e9;
+            if (rss_gb >= mem_limit_gb) {
+                fprintf(stderr,
+                        "\nMEMORY LIMIT: peak RSS %.2f GB >= %.2f GB "
+                        "(--mem-limit-gb) at token %d/%d -- stopping "
+                        "gracefully (exit 3)\n",
+                        rss_gb, mem_limit_gb, t, gen);
+                if (trf) fclose(trf);
+                if (dump_path && moe_mode) {
+                    FILE *df = fopen(dump_path, "wb");
+                    if (df) {
+                        fwrite(state, sizeof(float),
+                               (size_t)cfg.hidden * (size_t)mhc_streams, df);
+                        fclose(df);
+                    }
+                }
+                return 3;
+            }
+        }
         if (text_mode && t > 0) {
             ds4f_embed_gather(&embed, last_tok, state);
             for (int j = 1; j < mhc_streams; j++)
