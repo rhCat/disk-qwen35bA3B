@@ -8,8 +8,14 @@ CC      ?= cc
 #   make CFLAGS="-std=c99 -O0 -Wall -Wextra -pthread"
 ifeq ($(shell uname),Darwin)
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -pthread
+GPU_SRC  = src/gpu_metal.mm
+GPU_LIBS = -framework Metal -framework Foundation
+OBJCXX  ?= clang++
+OBJCXXFLAGS ?= -std=gnu++17 -O2 -Wall -Wextra
 else
 CFLAGS  ?= -std=c99 -O2 -Wall -Wextra -pthread
+GPU_SRC  = src/gpu_stub.c
+GPU_LIBS =
 endif
 INC      = -Iinclude -Isrc
 SRC      = src/cfg.c src/st.c src/trunk.c src/cache.c src/router.c src/mem.c src/kernels.c src/moe.c
@@ -19,12 +25,15 @@ HDR = include/ds4f/ds4f.h include/ds4f/kernels.h include/ds4f/moe.h \
       include/ds4f/tokenizer.h src/json.h
 SRC = src/cfg.c src/st.c src/trunk.c src/cache.c src/router.c src/mem.c \
       src/kernels.c src/moe.c src/simd.c src/attn.c src/attn_qwen.c \
-      src/head.c src/tokenizer.c
+      src/head.c src/tokenizer.c $(GPU_SRC)
 
 all: ds4f pack-trunk make-fixture bench-kernels
 
-ds4f: src/main.c $(SRC) $(HDR)
-	$(CC) $(CFLAGS) $(INC) -DDS4F_GIT=\"$(shell git rev-parse --short HEAD 2>/dev/null)\" -o $@ src/main.c $(SRC) -lm
+ds4f: src/main.c $(SRC) $(HDR) $(GPU_SRC:.mm=.o)
+	$(CC) $(CFLAGS) $(INC) -DDS4F_GIT=\"$(shell git rev-parse --short HEAD 2>/dev/null)\" -o $@ src/main.c $(filter-out %.mm,$(SRC)) $(GPU_SRC:.mm=.o) -lm $(GPU_LIBS)
+
+src/gpu_metal.o: src/gpu_metal.mm include/ds4f/gpu.h
+	$(OBJCXX) $(OBJCXXFLAGS) $(INC) -c src/gpu_metal.mm -o src/gpu_metal.o
 
 pack-trunk: tools/pack-trunk.c $(HDR)
 	$(CC) $(CFLAGS) $(INC) -o $@ tools/pack-trunk.c -lm
@@ -32,8 +41,8 @@ pack-trunk: tools/pack-trunk.c $(HDR)
 make-fixture: tools/make-fixture.c $(HDR)
 	$(CC) $(CFLAGS) $(INC) -o $@ tools/make-fixture.c -lm
 
-bench-kernels: tools/bench-kernels.c $(SRC) $(HDR)
-	$(CC) $(CFLAGS) $(INC) -o $@ tools/bench-kernels.c $(SRC) -lm
+bench-kernels: tools/bench-kernels.c $(SRC) $(HDR) $(GPU_SRC:.mm=.o)
+	$(CC) $(CFLAGS) $(INC) -o $@ tools/bench-kernels.c $(filter-out %.mm,$(SRC)) $(GPU_SRC:.mm=.o) -lm $(GPU_LIBS)
 
 test: all
 	./tests/run_tests.sh

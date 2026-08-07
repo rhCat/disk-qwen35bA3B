@@ -3,7 +3,7 @@
 set -u
 REPO=/Users/ruihe/disk-qwen35bA3B
 cd "$REPO"
-export DS4F_GREEDY=1 DS4F_REP_PENALTY=1.3
+export DS4F_GREEDY=1 DS4F_REP_PENALTY=1.3 DS4F_DEBUG7=1
 ./ds4f /tmp/q35-trunk \
   --trunk /tmp/q35-trunk/trunk.bin \
   --offsets /tmp/q35-trunk/trunk.offsets \
@@ -14,7 +14,7 @@ export DS4F_GREEDY=1 DS4F_REP_PENALTY=1.3
   --embed /tmp/q35-trunk/embed.json \
   --tokenizer /Users/ruihe/.cache/huggingface/mlx-qwen35-a3b-4bit/tokenizer.json \
   --pids-file /tmp/q35-qa-ids.txt \
-  --gen 100 --cache-gb 2 --pin-layers 4 --mem-limit-gb 20 \
+  --gen 100 --cache-gb 5 --pin-layers 4 --mem-limit-gb 20 \
   > /tmp/qa-run.log 2>&1
 echo "EXIT $?" >> /tmp/qa-run.log
 grep -E 'tokens in|PEAK|EXIT' /tmp/qa-run.log | tail -3

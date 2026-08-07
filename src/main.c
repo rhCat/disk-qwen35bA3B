@@ -38,6 +38,8 @@ static void usage(const char *argv0) {
         "  --pids-file FILE    read comma/space-separated token ids from a file\n"
         "  --tokenizer FILE    tokenizer.json (ids <-> text; decodes output)\n"
         "  --text S            prompt text, encoded via --tokenizer\n"
+        "  --gpu              offload the output-head matvec to Metal\n"
+        "                        (macOS; env DS4F_GPU=1; default CPU)\n"
         "  --cache-gb X        expert cache budget in GB       (default 5;\n"
         "                        env DS4F_CACHE_GB; CLI wins)\\n"
         "  --trunk-gb X        trunk pin budget in GB          (default 4)\n"
@@ -86,6 +88,11 @@ int main(int argc, char **argv) {
     double cache_gb = 5.0, trunk_gb = 4.0, locality = 0.0;
     double mem_limit_gb = 23.0;
     int pin_layers = -1, nring = 2, gen = 4, threads = 4, refuse = 1;
+    int use_gpu = 0;
+    const char *env_gpu = getenv("DS4F_GPU");
+    if (env_gpu && *env_gpu && strcmp(env_gpu, "0") != 0) use_gpu = 1;
+    /* --gpu and DS4F_GPU=1 both funnel through the env var; head.c
+     * reads DS4F_GPU to decide whether to try the Metal path. */
     /* DS4F_CACHE_GB env overrides the default (CLI --cache-gb still wins).
      * Default 2 GB: the 3-4 GB resident target; 8+ GB only when asked. */
     const char *env_cache_gb = getenv("DS4F_CACHE_GB");
@@ -104,6 +111,7 @@ int main(int argc, char **argv) {
             }
             else { fprintf(stderr, "unknown preset %s\n", argv[i]); return 1; }
         } else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gpu")) { use_gpu = 1; setenv("DS4F_GPU", "1", 1); }
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) trunk_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--pin-layers") && i + 1 < argc) pin_layers = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--nring") && i + 1 < argc) nring = atoi(argv[++i]);

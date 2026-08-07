@@ -1,12 +1,22 @@
 /* head.c -- output head + embedding + sampling (issue #6 step 3). */
 #include "ds4f/head.h"
 #include "ds4f/kernels.h"
+#include "ds4f/gpu.h"
 #include "json.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* GPU path is opt-in (--gpu / DS4F_GPU=1). Init lazily on first use;
+ * if Metal is unavailable the call returns -1 and we fall back to CPU
+ * for the rest of the run. CPU stays the default (byte-deterministic). */
+static int gpu_tried = 0, gpu_ok = 0;
+static int gpu_want(void) {
+    const char *e = getenv("DS4F_GPU");
+    return e && *e && strcmp(e, "0") != 0;
+}
 
 static long read_file_buf(const char *path, uint8_t **out) {
     FILE *f = fopen(path, "rb");
@@ -258,6 +268,18 @@ int ds4f_head_logits(const Ds4fHead *h, const float *state, float *logits) {
         long Hdec = H * 8;
         const uint16_t *bias = h->b_nbytes > 0
             ? (const uint16_t *)(const void *)(h->buf + h->b_off) : NULL;
+        if (gpu_want() && !gpu_tried) {
+            gpu_tried = 1;
+            gpu_ok = ds4f_gpu_init() == 0;
+        }
+        if (gpu_ok) {
+            if (ds4f_gpu_mlx4_matvec(
+                    (const uint32_t *)(const void *)(h->buf + h->w_off),
+                    (const uint16_t *)(const void *)(h->buf + h->s_off),
+                    bias, (int)V, (int)Hdec, state, logits) == 0)
+                return 0;
+            gpu_ok = 0;          /* fell through: use CPU from now on */
+        }
         ds4f_mlx4_matvec(
             (const uint32_t *)(const void *)(h->buf + h->w_off),
             (const uint16_t *)(const void *)(h->buf + h->s_off),
