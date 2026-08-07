@@ -224,7 +224,9 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     int npos = token + 1;
     for (int h = 0; h < heads; h++) {
         const float *qh_ptr = qq + (size_t)h * kh;
-        int khh = h % kv_heads;
+        /* GQA: kv head = h / (heads/kv_heads) -- repeat_kv grouping
+         * (q heads 0..7 -> kv head 0, 8..15 -> kv head 1) */
+        int khh = h / (heads / kv_heads);
         float mx = -1e30f;
         for (int t2 = 0; t2 < npos; t2++) {
             const float *k2 = kv->kv +

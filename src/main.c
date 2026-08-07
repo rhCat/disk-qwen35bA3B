@@ -213,6 +213,7 @@ int main(int argc, char **argv) {
     Ds4fKvCache kvc;
     int kv_ok = 0;
     int moe_mode = 0;
+    int kvlat = 0;              /* per-token KV bytes/layer (GQA/MLA) */
     float *state = NULL, *scratch = NULL;
     int mhc_streams = 1;      /* residual streams (n_hc), 1 without mHC */
     float **jscratch = NULL;
@@ -244,7 +245,7 @@ int main(int argc, char **argv) {
         plan.state_b += (double)scratch_n * 4.0 * (double)cfg.topk;
         /* KV cache: MLA (DS-V4, kvlat) or Qwen3 GQA (krows+vrows from
          * the first self_attn layer). Qwen3: 512+512=1024 floats/token. */
-        int kvlat = tl.kvlat;
+        kvlat = tl.kvlat;
         if (kvlat < 1) {
             for (int L2 = 0; L2 < cfg.n_layers && kvlat < 1; L2++) {
                 if (tl.q3_k[L2] >= 0) {
@@ -254,11 +255,6 @@ int main(int argc, char **argv) {
             }
         }
         if (kvlat < 1) kvlat = 1;
-        if (ds4f_kv_init(&kvc, cfg.n_layers, kvlat, gen) != 0) {
-            fprintf(stderr, "moe: kv cache init failed\n");
-            return 2;
-        }
-        kv_ok = 1;
         plan.state_b += (double)kvlat * 4.0 * (double)cfg.n_layers *
                         (double)gen;
         plan.need_b = plan.trunk_pin_b + plan.trunk_ring_b + plan.cache_b +
@@ -370,6 +366,16 @@ int main(int argc, char **argv) {
         plan.need_b = plan.trunk_pin_b + plan.trunk_ring_b + plan.cache_b +
                       plan.shared_b + plan.state_b + plan.index_b;
     }
+    if (moe_mode && !kv_ok) {
+        /* the KV cache must hold the whole prompt PLUS generated
+         * tokens (npids + gen positions) -- sized after the prompt
+         * parse so npids is known */
+        if (ds4f_kv_init(&kvc, cfg.n_layers, kvlat, npids + gen) != 0) {
+            fprintf(stderr, "moe: kv cache init failed\n");
+            return 2;
+        }
+        kv_ok = 1;
+    }
 
     if (moe_mode) {
         /* mHC: the residual stream is n_hc x H (n_hc from the first
@@ -435,7 +441,12 @@ int main(int argc, char **argv) {
     int last_tok = npids > 0 ? pids[0] : -1;
 
     double t0 = now_s();
-    for (int t = 0; t < gen; t++) {
+    /* prompt pass + generation: the first npids iterations feed the
+     * prompt tokens (no sampling, no output) so the KV/state caches
+     * see the whole context; the next gen iterations generate. */
+    int total_toks = npids + gen;
+    for (int t = 0; t < total_toks; t++) {
+        int gen_t = t - npids;       /* >= 0 once past the prompt */
         if (getenv("DS4F_TIME_LAYERS")) {
             static double tL0 = 0.0;
             if (t == 0) tL0 = now_s();
@@ -465,14 +476,14 @@ int main(int argc, char **argv) {
                 return 3;
             }
         }
-        if (text_mode && t > 0) {
+        if (text_mode && gen_t >= 0) {
             ds4f_embed_gather(&embed, last_tok, state);
             for (int j = 1; j < mhc_streams; j++)
                 memcpy(state + (size_t)j * cfg.hidden, state,
                        (size_t)cfg.hidden * sizeof(float));
-        } else if (text_mode && t == 0) {
-            ds4f_embed_gather(&embed, pids[0], state);
-            if (getenv("DS4F_NAN_PROBE")) {
+        } else if (text_mode) {
+            ds4f_embed_gather(&embed, pids[t], state);
+            if (getenv("DS4F_NAN_PROBE") && t == 0) {
                 double em = 0.0;
                 for (int i = 0; i < cfg.hidden; i++)
                     em += (double)state[i] * state[i];
@@ -842,8 +853,11 @@ int main(int argc, char **argv) {
                 }
                 fprintf(stderr, "\n");
             }
-            int tokid;
-            if (getenv("DS4F_GREEDY"))
+            int tokid = -1;
+            if (gen_t < 0) {
+                /* prompt pass: no sampling, no output -- the forward
+                 * ran so the caches saw this token */
+            } else if (getenv("DS4F_GREEDY"))
                 tokid = ds4f_argmax(logits, (int)head.dims[0]);
             else if (getenv("DS4F_TEMP")) {
                 float temp = (float)atof(getenv("DS4F_TEMP"));
@@ -854,6 +868,7 @@ int main(int argc, char **argv) {
             }
             else
                 tokid = ds4f_sample(logits, (int)head.dims[0], &rng);
+            if (gen_t >= 0) {
             if (tok_path) {
                 char tbuf[256];
                 int tl = ds4f_tokenizer_decode(&tok, &tokid, 1, tbuf, 256);
@@ -861,10 +876,11 @@ int main(int argc, char **argv) {
                 printf("%s", tbuf);
                 fflush(stdout);
             } else {
-                printf("%s%d", t ? " " : "", tokid);
+                printf("%s%d", gen_t ? " " : "", tokid);
                 fflush(stdout);
             }
             last_tok = tokid;
+            }
         }
         if (getenv("DS4F_DEBUG")) {
             uint64_t ck = ds4f_mix64(0);

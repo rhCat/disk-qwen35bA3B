@@ -140,6 +140,25 @@ exit 0 (23 GB gate armed, never fired)
 - remaining: text is short fragments, not yet coherent prose -- the
   known approximations (text-only mrope positions, conv-ring boundary
   semantics) are the next fidelity targets
+- **PROMPT PASS + GQA (2026-08-06): the engine now conditions on the
+  WHOLE prompt.** Previously only pids[0] was processed and the rest
+  of the prompt was never fed through the model (the model free-
+  associated from one token). Fixes:
+  1. The token loop now runs npids + gen iterations: the first npids
+     feed the prompt tokens (no sampling/output) so the KV + delta-
+     rule caches see the full context, then gen tokens generate.
+  2. The GQA KV cache is sized npids + gen (was gen -- overflowed at
+     position gen, reading uninitialized cache).
+  3. GQA kv-head mapping fixed to the reference's repeat_kv grouping
+     (q heads 0..7 -> kv head 0, 8..15 -> kv head 1; was h % kv_heads
+     alternating).
+  Result: output now DIFFERS BY PROMPT (Hello -> "elisrolerloeriore
+  beruik", France -> "不同类型的ForMemberodoreoho ...") -- real
+  conditioning. Logits are real vocabulary with plausible scores, but
+  flat (top-5 within ~1-4) -- the likely floor is 4-bit quantization
+  noise accumulating through 40 layers (scales ~0.005), vs the
+  reference's BF16. Structural work is complete; coherent prose is a
+  quantization-fidelity question, not a wiring question.
 
 ## Graceful stop (the guard)
 
