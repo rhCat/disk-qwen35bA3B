@@ -116,8 +116,10 @@ void ds4f_mlx4_decode(const uint32_t *vals, const uint16_t *scales,
             gcur = g;
             float s = bf16_to_f32(scales[g]);
             float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
+            /* MLX affine dequant: w = scale*q + bias (q raw 0..15).
+             * NO -8 offset -- that was a systematic per-group error */
             for (int q = 0; q < 16; q++)
-                lut[q] = ((float)q - 8.0f) * s + b;
+                lut[q] = (float)q * s + b;
         }
         int q = (int)((vals[k >> 3] >> (4 * (k & 7))) & 0xFu);
         out[k] = lut[q];
@@ -196,7 +198,7 @@ void ds4f_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
                 float s = bf16_to_f32(scales[g]);
                 float b = biases ? bf16_to_f32(biases[g]) : 0.0f;
                 for (int q = 0; q < 16; q++)
-                    lut[q] = ((float)q - 8.0f) * s + b;
+                    lut[q] = (float)q * s + b;
             }
             int q = (int)((vals[k >> 3] >> (4 * (int)(k & 7))) & 0xFu);
             acc += lut[q] * xr[c];

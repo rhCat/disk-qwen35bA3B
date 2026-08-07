@@ -185,13 +185,13 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
             uint32x4_t q10 = vmovl_u16(vget_low_u16(vmovl_u8(n1)));
             uint32x4_t q11 = vmovl_u16(vget_high_u16(vmovl_u8(n1)));
             vst1q_f32(row + c,
-                vmlaq_f32(bv, vsubq_f32(vcvtq_f32_u32(q00), vdupq_n_f32(8.0f)), sv));
+                vmlaq_f32(bv, vcvtq_f32_u32(q00), sv));
             vst1q_f32(row + c + 4,
-                vmlaq_f32(bv, vsubq_f32(vcvtq_f32_u32(q01), vdupq_n_f32(8.0f)), sv));
+                vmlaq_f32(bv, vcvtq_f32_u32(q01), sv));
             vst1q_f32(row + c + 8,
-                vmlaq_f32(bv, vsubq_f32(vcvtq_f32_u32(q10), vdupq_n_f32(8.0f)), sv));
+                vmlaq_f32(bv, vcvtq_f32_u32(q10), sv));
             vst1q_f32(row + c + 12,
-                vmlaq_f32(bv, vsubq_f32(vcvtq_f32_u32(q11), vdupq_n_f32(8.0f)), sv));
+                vmlaq_f32(bv, vcvtq_f32_u32(q11), sv));
         }
         /* scalar tail for C % 16 != 0 */
         for (; c < C; c++) {
@@ -199,7 +199,7 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
             int gl = (int)((c) / DS4F_MLX4_GROUP_LOCAL);
             long wl = (k - (size_t)r * C) >> 3;
             int q = (int)((vr[wl] >> (4 * (k & 7))) & 0xFu);
-            row[c] = ((float)q - 8.0f) * srow[gl] + brow[gl];
+            row[c] = (float)q * srow[gl] + brow[gl];
         }
         /* pass 2: pure FMA dot, 8 independent accumulators */
         for (int a = 0; a < 8; a++) acc[a] = vdupq_n_f32(0.0f);
@@ -643,7 +643,6 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
     if (r1 > R) r1 = R;
     const __m256i shift = _mm256_setr_epi32(0, 4, 8, 12, 16, 20, 24, 28);
     const __m256i mask = _mm256_set1_epi32(0x0F);
-    const __m256 eight = _mm256_set1_ps(8.0f);
     const __m256 one = _mm256_set1_ps(1.0f);
     for (int r = r0; r < r1; r++) {
         const uint32_t *vr = vals + (size_t)r * (C / 8);
@@ -663,7 +662,7 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
             __m256 f = _mm256_cvtepi32_ps(_mm256_and_si256(
                 _mm256_srlv_epi32(_mm256_set1_epi32((int)vr[w]), shift),
                 mask));
-            f = _mm256_fmadd_ps(_mm256_sub_ps(f, eight),
+            f = _mm256_fmadd_ps(f,
                                 _mm256_set1_ps(sf), _mm256_set1_ps(bf));
             acc = _mm256_fmadd_ps(f, _mm256_loadu_ps(x + c), acc);
         }

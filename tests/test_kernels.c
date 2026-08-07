@@ -356,7 +356,8 @@ int main(void) {
 
     /* 12: MLX 4-bit decode exactness on a hand-built known vector.
      * One U32 = 8 nibbles, low nibble first; one BF16 scale+bias per
-     * 64 elements. element = (q - 8) * scale + bias. */
+     * 64 elements. element = q * scale + bias (MLX affine dequant:
+     * raw 4-bit q in [0,15], NO 8-offset). */
     {
         uint32_t vals[8];                 /* 64 elements = 1 group */
         uint16_t scales[1], biases[1];
@@ -373,7 +374,7 @@ int main(void) {
         int ok = 1;
         for (int k = 0; k < 64; k++) {
             int q = k % 16;
-            float want = (float)q - 8.0f;
+            float want = (float)q;
             if (fabsf(out[k] - want) > 1e-6f) { ok = 0; break; }
         }
         if (!ok) { printf("FAIL test 12 (mlx4 decode known)\n"); return 1; }
@@ -384,7 +385,7 @@ int main(void) {
         v2[8] = 0x00000005;               /* element 64 = word 8, nibble 0 = 5 */
         float out2[72];
         ds4f_mlx4_decode(v2, sc2, bi2, 72, out2);
-        if (fabsf(out2[64] - (5.0f - 8.0f) * 2.0f) > 1e-6f) {
+        if (fabsf(out2[64] - 5.0f * 2.0f) > 1e-6f) {
             printf("FAIL test 12b (mlx4 group boundary)\n"); return 1;
         }
         printf("PASS test 12 (mlx4 decode known + group boundary)\n");
@@ -427,7 +428,7 @@ int main(void) {
                 float s, b;
                 memcpy(&s, &sb, 4);
                 memcpy(&b, &bb, 4);
-                acc += (((float)q - 8.0f) * s + b) * x[c];
+                acc += ((float)q * s + b) * x[c];
             }
             y2[r] = acc;
         }

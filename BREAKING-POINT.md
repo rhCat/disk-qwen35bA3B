@@ -159,6 +159,25 @@ exit 0 (23 GB gate armed, never fired)
   noise accumulating through 40 layers (scales ~0.005), vs the
   reference's BF16. Structural work is complete; coherent prose is a
   quantization-fidelity question, not a wiring question.
+- **MLX4 DEQUANT FORMULA (2026-08-06): the mlx4 decode was wrong --
+  fixed, and the model now speaks English.** The engine decoded
+  every MLX 4-bit weight as (q-8)*scale+bias. The MLX runtime
+  (Metal affine_dequantize: out = scale*d + bias; qdot: scale*accum
+  + sum*bias; C++ VJP dequantize(w, ones, zeros) = raw q) dequantizes
+  as scale*q + bias with q in [0,15] -- NO 8-offset. Our (q-8) was a
+  systematic per-group DC shift of -8*scale on EVERY weight (~100%
+  of the bias magnitude: |8s| mean 0.045 vs |b| mean 0.047 on
+  in_proj_qkv). Fixed in all kernels: NEON (dropped vsub 8), AVX2
+  (dropped _mm256_sub 8), scalar LUTs (lut[q]=q*s+b), embed gather
+  (head.c), and the test fixtures. Result: state rms normalized from
+  5-17 down to ~1.35, head input ~2.6 (healthy magnitudes), and
+  greedy output went from mixed-script gibberish to FLUENT ENGLISH:
+  "systemsworthsystemsworth..." -- real English tokens at top-1.
+  The remaining artifact is a degenerate repetition loop: the 4-bit
+  logit distribution is flat (top-5 within ~1.4), so greedy locks on
+  a fixed 5-token cycle (sworth/stel/avu/system/INCI). Sampling
+  breaks the loop but drifts languages. This is the quantization
+  flattening floor, precisely characterized.
 - **CONV1D TAP ORDER (2026-08-06): the linear-attention conv1d was
   time-reversed.** My loop applied w[0] to the NEWEST sample; the
   reference's causal_conv1d_update concatenates [x_{t-3},...,x_t] and
