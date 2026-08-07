@@ -89,3 +89,28 @@ different, poisoning every layer.
 - f83a7d1 shared expert
 - 2bb3d93 prompt pass
 - defe6e5 fidelity audit scaffold
+- 65ea92d topk no-renorm + first-token generation fixes (coherent output)
+- 261014e RoPE half-split pairing (t1 states match reference)
+
+## Memory model (measured 2026-08-07, M4 Pro 24 GB)
+
+Engine footprint (vmmap TOTAL resident, GEN=12, cache-gb 2):
+5.66 GB steady / 6.07 GB peak. At cache-gb 1: 4.72 / 5.07 GB.
+
+- **Expert cache arena** is the dominant term: `--cache-gb` (default **2**,
+  env `DS4F_CACHE_GB`, CLI `--cache-gb` wins; presets laptop=8/server=64
+  unless the env is set). The arena is calloc'd lazily — RSS grows as
+  distinct experts stream through (GEN=6 -> GEN=12: 4.4 -> 5.7 GB at
+  cache-gb 2).
+- **macOS malloc high-water**: vmmap shows MALLOC_LARGE(empty) ~1.4 GB and
+  MALLOC_REALLOC(empty) ~1.5 GB resident after per-token free/realloc of
+  state/scratch buffers — the zone keeps the pages. A `malloc_zone_
+  pressure_relief` / fixed-arena rework would reclaim this; not yet done.
+- **F_NOCACHE** on pool/trunk fds: pread pages otherwise get attributed to
+  the process in Activity Monitor (saw 10-12 GB for a ~6 GB process).
+- 3-4 GB target: cache-gb 1 + malloc relief still lands ~4.7 GB; the
+  remaining gap is the zone high-water, not the arena.
+
+Probes: `tools/mem-probe.sh` (live RSS), `tools/foot-probe.sh`,
+`tools/vmmap-probe.sh` / `tools/zmap-probe.sh` (footprint/zone breakdown).
+

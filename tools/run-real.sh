@@ -17,6 +17,7 @@ TRUNK="${1:-/tmp/q35-trunk}"
 POOL="${2:-/tmp/q35-pool}"
 GEN="${GEN:-4}"
 LIMIT="${LIMIT:-23}"
+CACHE_GB="${CACHE_GB:-2}"
 DUMP="${DUMP:-}"
 
 TOK="${TOK:-/Users/ruihe/.cache/huggingface/mlx-qwen35-a3b-4bit/tokenizer.json}"
@@ -30,7 +31,7 @@ if [ -n "$DUMP" ]; then DUMPARG=(--dump-state "$DUMP"); fi
   --layout-pool "$POOL/manifest.json" \
   --head "$TRUNK/head.json" --embed "$TRUNK/embed.json" \
   --tokenizer "$TOK" --text "${PROMPT:-The capital of France is}" \
-  --gen "$GEN" --cache-gb 2 --pin-layers 4 \
+  --gen "$GEN" --cache-gb "$CACHE_GB" --pin-layers 4 \
   --mem-limit-gb "$LIMIT" ${DUMPARG[@]+"${DUMPARG[@]}"} \
   ${NOSIMD:+--no-simd} \
   > /tmp/q35-run.log 2>&1

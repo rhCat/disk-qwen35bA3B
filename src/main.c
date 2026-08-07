@@ -37,7 +37,8 @@ static void usage(const char *argv0) {
         "  --prompt-ids S      comma-separated token ids (first = seed)\n"
         "  --tokenizer FILE    tokenizer.json (ids <-> text; decodes output)\n"
         "  --text S            prompt text, encoded via --tokenizer\n"
-        "  --cache-gb X        expert cache budget in GB       (default 8)\n"
+        "  --cache-gb X        expert cache budget in GB       (default 2;\\n"
+        "                        env DS4F_CACHE_GB; CLI wins)\\n"
         "  --trunk-gb X        trunk pin budget in GB          (default 4)\n"
         "  --pin-layers N      explicit pinned trunk prefix    (default auto)\n"
         "  --nring N           trunk ring slots, >= 2          (default 2)\n"
@@ -80,14 +81,25 @@ int main(int argc, char **argv) {
     const char *tl_path = NULL, *pl_path = NULL, *dump_path = NULL;
     const char *head_path = NULL, *embed_path = NULL, *prompt_ids = NULL;
     const char *tok_path = NULL, *text_arg = NULL;
-    double cache_gb = 8.0, trunk_gb = 4.0, locality = 0.0;
+    double cache_gb = 2.0, trunk_gb = 4.0, locality = 0.0;
     double mem_limit_gb = 23.0;
     int pin_layers = -1, nring = 2, gen = 4, threads = 4, refuse = 1;
+    /* DS4F_CACHE_GB env overrides the default (CLI --cache-gb still wins).
+     * Default 2 GB: the 3-4 GB resident target; 8+ GB only when asked. */
+    const char *env_cache_gb = getenv("DS4F_CACHE_GB");
+    int cache_gb_env = env_cache_gb && *env_cache_gb;
+    if (cache_gb_env) cache_gb = atof(env_cache_gb);
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--preset")) {
             if (++i >= argc) return usage(argv[0]), 1;
-            if (!strcmp(argv[i], "laptop")) { cache_gb = 8; trunk_gb = 4; }
-            else if (!strcmp(argv[i], "server")) { cache_gb = 64; trunk_gb = 48; nring = 4; }
+            if (!strcmp(argv[i], "laptop")) {
+                if (!cache_gb_env) cache_gb = 8;
+                trunk_gb = 4;
+            }
+            else if (!strcmp(argv[i], "server")) {
+                if (!cache_gb_env) cache_gb = 64;
+                trunk_gb = 48; nring = 4;
+            }
             else { fprintf(stderr, "unknown preset %s\n", argv[i]); return 1; }
         } else if (!strcmp(argv[i], "--cache-gb") && i + 1 < argc) cache_gb = atof(argv[++i]);
         else if (!strcmp(argv[i], "--trunk-gb") && i + 1 < argc) trunk_gb = atof(argv[++i]);
