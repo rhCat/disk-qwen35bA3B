@@ -72,7 +72,9 @@ def main():
         return fn, pb + a, b - a, h[name]["dtype"], list(h[name]["shape"])
 
     # ---- collect per-layer dense tensors (exclude pool + vision + MTP)
-    SKIP = ("switch_mlp", "vision", "mtp", "shared_expert",
+    # shared_expert is a DENSE every-token MLP (like the router gate),
+    # NOT part of the switch_mlp pool -- it must be in the trunk.
+    SKIP = ("switch_mlp", "vision", "mtp",
             "embed_tokens", "lm_head", "language_model.norm")
     layers = {}
     for name in wm:

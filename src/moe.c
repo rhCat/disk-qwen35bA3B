@@ -184,6 +184,10 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
     for (int L = 0; L < DS4F_MAX_LAYERS; L++) {
         tl->gate[L] = tl->down[L] = tl->up[L] = -1;
         tl->gate_bias[L] = -1;
+        tl->se_g[L] = tl->se_gs[L] = tl->se_gb[L] = -1;
+        tl->se_u[L] = tl->se_us[L] = tl->se_ub[L] = -1;
+        tl->se_d[L] = tl->se_ds[L] = tl->se_db[L] = -1;
+        tl->se_r[L] = tl->se_rs[L] = tl->se_rb[L] = -1;
         tl->attn_qn[L] = tl->attn_kvn[L] = -1;
         tl->attn_wqa[L] = tl->attn_wqa_s[L] = -1;
         tl->attn_wqb[L] = tl->attn_wqb_s[L] = -1;
@@ -306,6 +310,42 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
                 } else if (name_ends(tt->name, ".mlp.gate.biases") &&
                            tt->dtype == 0) {
                     if (tl->gate_bias[L] < 0) tl->gate_bias[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.gate_proj.weight")) {
+                    if (tl->se_g[L] < 0) tl->se_g[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.gate_proj.scales")) {
+                    if (tl->se_gs[L] < 0) tl->se_gs[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.gate_proj.biases")) {
+                    if (tl->se_gb[L] < 0) tl->se_gb[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.up_proj.weight")) {
+                    if (tl->se_u[L] < 0) tl->se_u[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.up_proj.scales")) {
+                    if (tl->se_us[L] < 0) tl->se_us[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.up_proj.biases")) {
+                    if (tl->se_ub[L] < 0) tl->se_ub[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.down_proj.weight")) {
+                    if (tl->se_d[L] < 0) tl->se_d[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.down_proj.scales")) {
+                    if (tl->se_ds[L] < 0) tl->se_ds[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert.down_proj.biases")) {
+                    if (tl->se_db[L] < 0) tl->se_db[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert_gate.weight")) {
+                    if (tl->se_r[L] < 0) tl->se_r[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert_gate.scales")) {
+                    if (tl->se_rs[L] < 0) tl->se_rs[L] = k - 1;
+                } else if (name_ends(tt->name,
+                                     ".mlp.shared_expert_gate.biases")) {
+                    if (tl->se_rb[L] < 0) tl->se_rb[L] = k - 1;
                 } else if (name_ends(tt->name, ".ffn.gate.weight") &&
                     (tt->dtype == 0 || tt->dtype == 4)) {
                     if (tl->gate[L] < 0) tl->gate[L] = k - 1;
@@ -971,6 +1011,69 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     }
     for (int j = 0; j < njob; j++)
         free(job[j].out);            /* scratch is borrowed */
+
+    /* shared expert (Qwen3.5): dense every-token MLP added after the
+     * routed experts -- acc += sigmoid(shared_expert_gate(xin)) *
+     * down(silu(gate(xin)) * up(xin)). Same mlx4 triplets. */
+    if (tl->se_g[L] >= 0 && tl->se_u[L] >= 0 && tl->se_d[L] >= 0 &&
+        tl->se_gs[L] >= 0 && tl->se_us[L] >= 0 && tl->se_ds[L] >= 0 &&
+        tl->se_r[L] >= 0 && tl->se_rs[L] >= 0 && tl->se_rb[L] >= 0) {
+        const Ds4fTrunkTensor *t0 = &tl->t[tl->se_g[L]];
+        long M = t0->dims[0];        /* 512 (moe_intermediate_size) */
+        float *sg = (float *)malloc((size_t)(M * 3 + H + 1) * sizeof(float));
+        if (sg) {
+            float *upv = sg + M;
+            float *chain = sg + 2 * M;
+            float *sout = sg + 3 * M;      /* H floats */
+            float sgate[1];
+            ds4f_mlx4_matvec((const uint32_t *)(const void *)
+                                 (tr + tl->t[tl->se_g[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_gs[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_gb[L]].off),
+                             (int)M, (int)H, xin, sg);
+            ds4f_mlx4_matvec((const uint32_t *)(const void *)
+                                 (tr + tl->t[tl->se_u[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_us[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_ub[L]].off),
+                             (int)M, (int)H, xin, upv);
+            for (long i = 0; i < M; i++) {
+                float s = sg[i];
+                float sig = 1.0f / (1.0f + expf(-s));
+                chain[i] = sig * upv[i];     /* silu(gate)*up */
+            }
+            ds4f_mlx4_matvec((const uint32_t *)(const void *)
+                                 (tr + tl->t[tl->se_d[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_ds[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_db[L]].off),
+                             (int)H, (int)M, chain, sout);
+            ds4f_mlx4_matvec((const uint32_t *)(const void *)
+                                 (tr + tl->t[tl->se_r[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_rs[L]].off),
+                             (const uint16_t *)(const void *)
+                                 (tr + tl->t[tl->se_rb[L]].off),
+                             1, (int)H, xin, sgate);
+            {
+                float sg2 = 1.0f / (1.0f + expf(-sgate[0]));
+                for (int i = 0; i < H; i++)
+                    acc[i] += sg2 * sout[i];
+                if (getenv("DS4F_DEBUG_CHAIN") && L < 3) {
+                    double o2 = 0.0;
+                    for (int i = 0; i < H; i++)
+                        o2 += (double)sout[i] * sout[i];
+                    fprintf(stderr, "[shared] L%d gate=%.4f out-rms %.6g\n",
+                            L, sg2, sqrt(o2 / (double)H));
+                }
+            }
+            free(sg);
+        }
+    }
 
     if (getenv("DS4F_NAN_PROBE") && L < 3) {
         double a2 = 0.0, i2 = 0.0;
