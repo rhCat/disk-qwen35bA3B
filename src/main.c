@@ -93,6 +93,14 @@ int main(int argc, char **argv) {
     if (env_gpu && *env_gpu && strcmp(env_gpu, "0") != 0) use_gpu = 1;
     /* --gpu and DS4F_GPU=1 both funnel through the env var; head.c
      * reads DS4F_GPU to decide whether to try the Metal path. */
+    /* DS4F_STRIP_THINK=1 (opt-in, default off): suppress the model's
+     * <think>...</think> reasoning trace in the decoded stdout. The
+     * trace is still GENERATED (it conditions the answer via the KV
+     * cache); only the printed text is filtered. Standard serving
+     * pattern for reasoning models (Qwen3/DeepSeek-R1/o-series). */
+    int strip_think = 0;
+    const char *env_st = getenv("DS4F_STRIP_THINK");
+    if (env_st && *env_st && strcmp(env_st, "0") != 0) strip_think = 1;
     /* DS4F_CACHE_GB env overrides the default (CLI --cache-gb still wins).
      * Default 2 GB: the 3-4 GB resident target; 8+ GB only when asked. */
     const char *env_cache_gb = getenv("DS4F_CACHE_GB");
@@ -546,6 +554,7 @@ int main(int argc, char **argv) {
      * prompt tokens (no sampling, no output) so the KV/state caches
      * see the whole context; the next gen iterations generate. */
     int total_toks = npids + gen;
+    int in_think = 0;            /* DS4F_STRIP_THINK state (opt-in) */
     for (int t = 0; t < total_toks; t++) {
         int gen_t = t - npids;       /* >= 0 once past the prompt */
         if (getenv("DS4F_TIME_LAYERS")) {
@@ -1113,7 +1122,21 @@ int main(int argc, char **argv) {
                 char tbuf[256];
                 int tl = ds4f_tokenizer_decode(&tok, &tokid, 1, tbuf, 256);
                 (void)tl;
-                printf("%s", tbuf);
+                /* opt-in think-trace suppression: <think>...</think>
+                 * is still generated (conditions the answer) but not
+                 * printed. Token-boundary safe: the tokenizer keeps
+                 * the tags as single added tokens. */
+                if (strip_think) {
+                    if (in_think) {
+                        if (strstr(tbuf, "</think>")) in_think = 0;
+                    } else if (strstr(tbuf, "<think>")) {
+                        in_think = 1;
+                    } else {
+                        printf("%s", tbuf);
+                    }
+                } else {
+                    printf("%s", tbuf);
+                }
                 fflush(stdout);
             } else {
                 printf("%s%d", gen_t ? " " : "", tokid);

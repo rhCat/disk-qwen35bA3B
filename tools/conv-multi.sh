@@ -5,7 +5,7 @@
 set -u
 REPO=/Users/ruihe/disk-qwen35bA3B
 cd "$REPO"
-export DS4F_TOP_P=0.9 DS4F_TEMP=0.8 DS4F_REP_PENALTY=1.15 DS4F_DEBUG7=1
+export DS4F_GREEDY=1 DS4F_REP_PENALTY=1.3 DS4F_STRIP_THINK=1 DS4F_DEBUG7=1
 unset PYTHONPATH
 PY="$REPO/.venv/bin/python3"
 HFBASE="$(cd "$HOME/.cache" 2>/dev/null && pwd)/huggingface"
