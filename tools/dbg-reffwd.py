@@ -159,9 +159,19 @@ VD = 128   # linear value head dim
 HEADS = 16 # GQA q heads
 RDD = 64   # rotary dims (partial 0.25 * 256)
 
-# ---- prompt (8 prompt tokens + the engine's 1st GENERATED token.
-# Post-fix greedy picks 279 "the" at t7 (the 15.72 > Jupiter 15.57).)
-pids = [760, 7526, 11247, 303, 279, 12570, 1785, 369, 279]
+# ---- prompt (129 tokens: Roman Empire history passage)
+pids = [760, 12386, 19825, 8379, 1141, 11848, 49653, 12450, 1172, 279,
+        54884, 16788, 22127, 303, 220, 16, 16, 22, 9343, 11, 948, 424,
+        13668, 16757, 4097, 3410, 9057, 39229, 314, 4128, 13, 561,
+        30315, 557, 17249, 1083, 22426, 321, 17942, 71592, 303, 220,
+        17, 23, 20, 9343, 539, 7521, 499, 1112, 1068, 11, 321, 279,
+        17942, 4139, 10729, 303, 220, 19, 22, 21, 9343, 948, 279, 1483,
+        54884, 11437, 18835, 5963, 18835, 557, 401, 3736, 539, 496,
+        2887, 9298, 13, 561, 22426, 4139, 11, 3750, 430, 279, 78844,
+        37085, 19825, 11, 25057, 2980, 220, 16, 19, 20, 18, 948, 88047,
+        1125, 10729, 310, 279, 66675, 19825, 1172, 64956, 1993, 279,
+        1160, 15487, 269, 13, 561, 78844, 37085, 19825, 32471, 1691,
+        314, 12386, 2253, 11, 17326, 6618, 11, 321, 8608, 51745]
 T = len(pids)
 print('prompt tokens:', pids)
 
@@ -179,6 +189,10 @@ def embed_row(tokid):
     sc_r = sc[tokid * 32:(tokid + 1) * 32]
     bi_r = bi[tokid * 32:(tokid + 1) * 32]
     return decode(row[None, :], sc_r[None, :], bi_r[None, :])[0]
+
+e279 = embed_row(279)
+e279.astype(np.float32).tofile('/tmp/q35-ref-embed-279.bin')
+print('ref embed_row(279) rms %.6g' % float(np.sqrt((e279**2).mean())))
 
 # ---- rope
 def rope_apply(qk, pos, rd):
@@ -418,6 +432,8 @@ for t in range(T):
                 float(rout_r), float(np.sqrt((sd**2).mean())),
                 float(sgate)), flush=True)
         h = h + acc
+        if L == N_LAYERS - 1:
+            h.astype(np.float32).tofile('/tmp/q35-ref-final-t%d.bin' % t)
         if (t == 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1)) or (t > 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1)):
             print('t%d L%d state rms %.4g' % (t, L,
                   float(np.sqrt((h**2).mean()))), flush=True)

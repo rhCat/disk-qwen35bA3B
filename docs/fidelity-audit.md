@@ -66,12 +66,37 @@ in the engine's math, not the weights.
 | logits cosine (9 tokens) | 0.934 |
 | state cosine (9 tokens, pre-norm) | 0.852 |
 
-The remaining gap (state cosine 0.852 at 9 tokens) is under investigation —
-the engine is not yet bit-faithful across the full 40-layer stack at
-position > 0. Candidate: residual float32 accumulation through the delta
-rule state, or another subtle per-layer issue. The generation-level quality
-is now reference-faithful enough that greedy answers are correct where the
-weights know the fact (Jupiter, Everest, 100°C, Washington).
+## Long-context verification (does drift compound?)
+
+**21-token prompt** (per-token final states, engine vs ref):
+- t0–t8: cosine **1.00000000** (bit-exact)
+- t9–t20: cosine 0.9997–0.9999, rel within 2% — float32 accumulation, damped not amplified
+
+**129-token prompt** (Roman Empire passage, per-token final states):
+- t0–t16: 1.00000000; t32: 0.999998; t64: 0.999997; t112: 0.999971; t128: 0.999999
+- **Flat at 5–6 nines through 128 tokens — the drift does NOT compound.**
+
+Why it stays flat: the delta-rule state is decayed every token (`state *= exp(g)`,
+g ≈ -0.0005) and every layer renormalizes via RMSNorm — per-token float32
+perturbations are damped, not amplified. The engine adds no systematic error
+vs mlx-lm at any measured context length.
+
+**20K-token stress run** (`tools/run20k.sh`, `--pids-file` support added for
+prompts beyond argv limits): periodic `[stab]` final-state rms every 2K tokens
+confirms bounded states (t=2000 rms 0.284, in the normal distribution range),
+no NaN. Run cost is flat ~0.12 s/token prompt / ~0.30 s/token generation —
+a normal conversation turn (300+150 tokens) is ~1-2 minutes; the 20K run is
+slow only because it is 20K tokens.
+
+## Sampling / repetition
+
+- `DS4F_REP_PENALTY` (HF-style multiplicative over a 64-token window) breaks
+  greedy long-context loops ("... X. X. X. ..."). With 1.3: France -> "Paris",
+  2+2 -> "$4$", mountain -> "Everest" (chat format, greedy).
+- `DS4F_TEMP` (softmax temperature before sampling) available.
+- Qwen3.5 is a reasoning model: chat prompts need the full
+  `<|im_start|>...<|im_start|>assistant\n<think>\n` template; generation
+  starts with a think block, so give it room (GEN >= 64) to reach the answer.
 
 ## Memory findings (measured)
 

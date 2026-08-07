@@ -35,6 +35,7 @@ static void usage(const char *argv0) {
         "  --head FILE         head.json (logits; enables text mode)\n"
         "  --embed FILE        embed.json (embedding table; text mode)\n"
         "  --prompt-ids S      comma-separated token ids (first = seed)\n"
+        "  --pids-file FILE    read comma/space-separated token ids from a file\n"
         "  --tokenizer FILE    tokenizer.json (ids <-> text; decodes output)\n"
         "  --text S            prompt text, encoded via --tokenizer\n"
         "  --cache-gb X        expert cache budget in GB       (default 2;\\n"
@@ -80,6 +81,7 @@ int main(int argc, char **argv) {
     const char *trace_path = NULL, *prompt = "ds4f", *pool_path = NULL;
     const char *tl_path = NULL, *pl_path = NULL, *dump_path = NULL;
     const char *head_path = NULL, *embed_path = NULL, *prompt_ids = NULL;
+    const char *pids_file = NULL;
     const char *tok_path = NULL, *text_arg = NULL;
     double cache_gb = 2.0, trunk_gb = 4.0, locality = 0.0;
     double mem_limit_gb = 23.0;
@@ -121,6 +123,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--head") && i + 1 < argc) head_path = argv[++i];
         else if (!strcmp(argv[i], "--embed") && i + 1 < argc) embed_path = argv[++i];
         else if (!strcmp(argv[i], "--prompt-ids") && i + 1 < argc) prompt_ids = argv[++i];
+        else if (!strcmp(argv[i], "--pids-file") && i + 1 < argc) pids_file = argv[++i];
         else if (!strcmp(argv[i], "--tokenizer") && i + 1 < argc) tok_path = argv[++i];
         else if (!strcmp(argv[i], "--text") && i + 1 < argc) text_arg = argv[++i];
         else if (!strcmp(argv[i], "--no-refuse")) refuse = 0;
@@ -371,6 +374,35 @@ int main(int argc, char **argv) {
                 pids[npids++] = atoi(tok);
             }
             free(dup);
+        } else if (pids_file) {
+            /* --pids-file: comma/space-separated ids from a file (for
+             * long prompts that exceed argv limits, e.g. 20K tokens) */
+            FILE *pf = fopen(pids_file, "rb");
+            if (!pf) {
+                fprintf(stderr, "cannot read %s\n", pids_file);
+                return 2;
+            }
+            fseek(pf, 0, SEEK_END);
+            long fsz = ftell(pf);
+            fseek(pf, 0, SEEK_SET);
+            if (fsz < 1 || fsz > (1L << 30)) { fclose(pf); return 2; }
+            char *fbuf = (char *)malloc((size_t)fsz + 1);
+            if (!fbuf) { fclose(pf); return 2; }
+            if (fread(fbuf, 1, (size_t)fsz, pf) != (size_t)fsz) {
+                free(fbuf); fclose(pf); return 2;
+            }
+            fclose(pf);
+            fbuf[fsz] = 0;
+            char *save = NULL;
+            for (char *tok = strtok_r(fbuf, ", \t\r\n", &save); tok;
+                 tok = strtok_r(NULL, ", \t\r\n", &save)) {
+                int *np = (int *)realloc(pids,
+                    (size_t)(npids + 1) * sizeof(int));
+                if (!np) { free(fbuf); return 2; }
+                pids = np;
+                pids[npids++] = atoi(tok);
+            }
+            free(fbuf);
         }
         text_mode = 1;
         plan.state_b += (double)head.buf_n + (double)embed.buf_n +
@@ -816,13 +848,32 @@ int main(int argc, char **argv) {
                         fclose(sf);
                     }
                 }
-                if (L < 2 || L % 8 == 0 || L >= 27 || t < 2 ||
-                    (t == 1 && L < 8)) {
+                if (L == cfg.n_layers - 1 && t < 21) {
+                    char pth[128];
+                    snprintf(pth, sizeof pth, "/tmp/q35-eng-final-t%d.bin", t);
+                    FILE *sf = fopen(pth, "wb");
+                    if (sf) {
+                        fwrite(state, sizeof(float), (size_t)cfg.hidden, sf);
+                        fclose(sf);
+                    }
+                }
+                if (getenv("DS4F_NAN_PROBE") && L == cfg.n_layers - 1 &&
+                    t > 0 && t % 2000 == 0) {
                     double sm = 0.0;
                     for (int i = 0; i < cfg.hidden; i++)
                         sm += (double)state[i] * state[i];
-                    fprintf(stderr, "[st] t%d after L%d rms %.6g\n",
-                            t, L, sqrt(sm / cfg.hidden));
+                    fprintf(stderr, "[stab] t=%d final-state rms %.6g\n",
+                            t, sqrt(sm / cfg.hidden));
+                }
+                if (L < 2 || L % 8 == 0 || L >= 27 || t < 2 ||
+                    (t == 1 && L < 8)) {
+                    if (t < 64 || (t % 2000 == 0)) {
+                        double sm = 0.0;
+                        for (int i = 0; i < cfg.hidden; i++)
+                            sm += (double)state[i] * state[i];
+                        fprintf(stderr, "[st] t%d after L%d rms %.6g\n",
+                                t, L, sqrt(sm / cfg.hidden));
+                    }
                 }
             }
         }
