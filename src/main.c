@@ -451,6 +451,15 @@ int main(int argc, char **argv) {
         (size_t)cfg.hidden * sizeof(float));
     if (!prev_hin) return 2;
     int last_tok = npids > 0 ? pids[0] : -1;
+    /* repetition penalty: DS4F_REP_PENALTY (multiplicative, HF-style).
+     * Recent generated tokens get logits[i] /= penalty before sampling
+     * so greedy/temp can't lock into "... X. X. X. ..." loops. */
+    int recent_toks[64], n_recent = 0;
+    float rep_pen = 0.0f;
+    {
+        const char *rp = getenv("DS4F_REP_PENALTY");
+        if (rp && *rp) rep_pen = (float)atof(rp);
+    }
 
     double t0 = now_s();
     /* prompt pass + generation: the first npids iterations feed the
@@ -493,6 +502,21 @@ int main(int argc, char **argv) {
             for (int j = 1; j < mhc_streams; j++)
                 memcpy(state + (size_t)j * cfg.hidden, state,
                        (size_t)cfg.hidden * sizeof(float));
+            if (getenv("DS4F_NAN_PROBE") && t == 8) {
+                FILE *ef = fopen("/tmp/q35-eng-embed-t8.bin", "wb");
+                if (ef) {
+                    fwrite(state, sizeof(float), (size_t)cfg.hidden, ef);
+                    fclose(ef);
+                }
+                fprintf(stderr, "[emb8] tok %d rms %.6g\n", last_tok,
+                        sqrt((double)cfg.hidden) > 0
+                            ? 0.0 : 0.0);
+                double em = 0.0;
+                for (int i = 0; i < cfg.hidden; i++)
+                    em += (double)state[i] * state[i];
+                fprintf(stderr, "[emb8] tok %d rms %.6g\n", last_tok,
+                        sqrt(em / cfg.hidden));
+            }
         } else if (text_mode) {
             ds4f_embed_gather(&embed, pids[t], state);
             if (getenv("DS4F_NAN_PROBE") && t == 0) {
@@ -938,6 +962,14 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "\n");
             }
             int tokid = -1;
+            if (gen_t >= 0 && rep_pen > 1.0f) {
+                /* HF-style multiplicative repetition penalty over the
+                 * recent generated window (greedy + sampled paths) */
+                for (int i = 0; i < (int)head.dims[0]; i++) {
+                    for (int r = 0; r < n_recent; r++)
+                        if (recent_toks[r] == i) { logits[i] /= rep_pen; break; }
+                }
+            }
             if (gen_t < 0) {
                 /* prompt pass: no output -- but the LAST prompt token's
                  * logits predict the FIRST generated token. Capture that
@@ -974,6 +1006,10 @@ int main(int argc, char **argv) {
                 fflush(stdout);
             }
             last_tok = tokid;
+            if (gen_t >= 0 && rep_pen > 1.0f) {
+                recent_toks[n_recent % 64] = tokid;
+                if (n_recent < 64) n_recent++;
+            }
             }
         }
         if (getenv("DS4F_DEBUG")) {
