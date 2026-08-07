@@ -148,20 +148,6 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
     if (r1 > R) r1 = R;
     float srow[64], brow[64];
     float32x4_t acc[8];
-    /* Per-thread scratch row: this function is called concurrently by
-     * the 8 expert worker threads and the head's row-split threads, so
-     * the buffer MUST be thread-local (a static would race). Grow on
-     * demand and reuse across calls -- kills ~960 mallocs/token in the
-     * expert path (the hot loop). TLS is bounded: 16 threads x max C. */
-    static __thread float *tl_row = NULL;
-    static __thread size_t tl_row_cap = 0;
-    if ((size_t)C > tl_row_cap) {
-        float *nr = (float *)realloc(tl_row, (size_t)C * sizeof(float));
-        if (!nr) return;
-        tl_row = nr;
-        tl_row_cap = (size_t)C;
-    }
-    float *row = tl_row;
     for (int r = r0; r < r1; r++) {
         const uint32_t *vr = vals + (size_t)r * (C / 8);
         int ng = (C + DS4F_MLX4_GROUP_LOCAL - 1) / DS4F_MLX4_GROUP_LOCAL;
@@ -176,7 +162,12 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
             memcpy(&srow[g], &sb, 4);
             memcpy(&brow[g], &bb, 4);
         }
-        /* pass 1: decode to a scratch row (vectorized) */
+        /* FUSED decode+FMA: no scratch row. Decode 16 elements to
+         * d0..d3, FMA straight into the accumulators. The accumulator
+         * mapping (c>>2)&7 is 0 or 4 for c%16==0, so acc[a] always
+         * owns columns {a, a+8, ...} mod 32 -- bit-identical to the
+         * old pass-1/pass-2 split, minus the row round-trip. */
+        for (int a = 0; a < 8; a++) acc[a] = vdupq_n_f32(0.0f);
         int w = 0;
         int c = 0;
         for (; c + 15 < C; c += 16, w += 2) {
@@ -196,36 +187,32 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
             uint32x4_t q01 = vmovl_u16(vget_high_u16(vmovl_u8(n0)));
             uint32x4_t q10 = vmovl_u16(vget_low_u16(vmovl_u8(n1)));
             uint32x4_t q11 = vmovl_u16(vget_high_u16(vmovl_u8(n1)));
-            vst1q_f32(row + c,
-                vmlaq_f32(bv, vcvtq_f32_u32(q00), sv));
-            vst1q_f32(row + c + 4,
-                vmlaq_f32(bv, vcvtq_f32_u32(q01), sv));
-            vst1q_f32(row + c + 8,
-                vmlaq_f32(bv, vcvtq_f32_u32(q10), sv));
-            vst1q_f32(row + c + 12,
-                vmlaq_f32(bv, vcvtq_f32_u32(q11), sv));
+            float32x4_t d0 = vmlaq_f32(bv, vcvtq_f32_u32(q00), sv);
+            float32x4_t d1 = vmlaq_f32(bv, vcvtq_f32_u32(q01), sv);
+            float32x4_t d2 = vmlaq_f32(bv, vcvtq_f32_u32(q10), sv);
+            float32x4_t d3 = vmlaq_f32(bv, vcvtq_f32_u32(q11), sv);
+            int ab = (c >> 2) & 7;   /* 0 or 4 for c%16==0 */
+            acc[ab + 0] = vmlaq_f32(acc[ab + 0], d0, vld1q_f32(x + c));
+            acc[ab + 1] = vmlaq_f32(acc[ab + 1], d1, vld1q_f32(x + c + 4));
+            acc[ab + 2] = vmlaq_f32(acc[ab + 2], d2, vld1q_f32(x + c + 8));
+            acc[ab + 3] = vmlaq_f32(acc[ab + 3], d3, vld1q_f32(x + c + 12));
         }
-        /* scalar tail for C % 16 != 0 */
+        /* reduce the accumulators FIRST, then the scalar tail --
+         * same summation order as the original pass-1/pass-2 split,
+         * so results stay bit-identical (incl. fixture shapes like
+         * C=200 where the tail is non-empty) */
+        float32x4_t s4 = vdupq_n_f32(0.0f);
+        for (int a = 0; a < 8; a++) s4 = vaddq_f32(s4, acc[a]);
+        float32x2_t t = vadd_f32(vget_low_f32(s4), vget_high_f32(s4));
+        float s = vget_lane_f32(t, 0) + vget_lane_f32(t, 1);
+        /* scalar tail for C % 16 != 0: decode + FMA in one step */
         for (; c < C; c++) {
             long k = (size_t)r * C + c;
             int gl = (int)((c) / DS4F_MLX4_GROUP_LOCAL);
             long wl = (k - (size_t)r * C) >> 3;
             int q = (int)((vr[wl] >> (4 * (k & 7))) & 0xFu);
-            row[c] = (float)q * srow[gl] + brow[gl];
+            s += ((float)q * srow[gl] + brow[gl]) * x[c];
         }
-        /* pass 2: pure FMA dot, 8 independent accumulators */
-        for (int a = 0; a < 8; a++) acc[a] = vdupq_n_f32(0.0f);
-        int c2 = 0;
-        for (; c2 + 31 < C; c2 += 32) {
-            for (int a = 0; a < 8; a++)
-                acc[a] = vmlaq_f32(acc[a], vld1q_f32(row + c2 + 4 * a),
-                                   vld1q_f32(x + c2 + 4 * a));
-        }
-        float32x4_t s4 = vdupq_n_f32(0.0f);
-        for (int a = 0; a < 8; a++) s4 = vaddq_f32(s4, acc[a]);
-        float32x2_t t = vadd_f32(vget_low_f32(s4), vget_high_f32(s4));
-        float s = vget_lane_f32(t, 0) + vget_lane_f32(t, 1);
-        for (; c2 < C; c2++) s += row[c2] * x[c2];
         y[r] = s;
     }
 }
