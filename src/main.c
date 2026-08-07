@@ -746,7 +746,8 @@ int main(int argc, char **argv) {
                     if (state[i] != state[i]) { bad = 1; break; }
                 if (bad)
                     fprintf(stderr, "[nan] t%d after L%d\n", t, L);
-                if (L < 2 || L % 8 == 0 || L >= 27 || t < 2) {
+                if (L < 2 || L % 8 == 0 || L >= 27 || t < 2 ||
+                    (t == 1 && L < 8)) {
                     double sm = 0.0;
                     for (int i = 0; i < cfg.hidden; i++)
                         sm += (double)state[i] * state[i];

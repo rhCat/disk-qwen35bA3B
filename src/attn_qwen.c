@@ -186,20 +186,24 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         }
         for (int h = 0; h < heads; h++) {
             float *hq = qq + (size_t)h * kh;
+            /* mlx nn.RoPE traditional=False: HALF-SPLIT pairs (d, d+rd/2),
+             * NOT interleaved (2i, 2i+1). Verified against mx.fast.rope.
+             * (mrope_interleaved in config is a transformers-ism; mlx-lm
+             * qwen3_next.py uses initialize_rope(traditional=False).) */
             for (int i = 0; i < rd / 2; i++) {
-                float x0 = hq[2 * i], x1 = hq[2 * i + 1];
+                float x0 = hq[i], x1 = hq[i + rd / 2];
                 float c = cos_t[i], s = sin_t[i];
-                hq[2 * i] = x0 * c - x1 * s;
-                hq[2 * i + 1] = x0 * s + x1 * c;
+                hq[i] = x0 * c - x1 * s;
+                hq[i + rd / 2] = x0 * s + x1 * c;
             }
         }
         for (int h = 0; h < kv_heads; h++) {
             float *hk = k + (size_t)h * kh;
             for (int i = 0; i < rd / 2; i++) {
-                float x0 = hk[2 * i], x1 = hk[2 * i + 1];
+                float x0 = hk[i], x1 = hk[i + rd / 2];
                 float c = cos_t[i], s = sin_t[i];
-                hk[2 * i] = x0 * c - x1 * s;
-                hk[2 * i + 1] = x0 * s + x1 * c;
+                hk[i] = x0 * c - x1 * s;
+                hk[i + rd / 2] = x0 * s + x1 * c;
             }
         }
         free(cos_t);
@@ -328,14 +332,21 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         free(buf);
         return -1;
     }
-    if (getenv("DS4F_NAN_PROBE") && L == 3) {
+    if (getenv("DS4F_NAN_PROBE") && (L == 3 || L == 7)) {
         double o2 = 0.0, a2 = 0.0;
         for (int i = 0; i < H; i++) o2 += (double)o[i] * o[i];
         for (int i = 0; i < ocols; i++)
             a2 += (double)attn_out[i] * attn_out[i];
-        fprintf(stderr, "[gqa] L3 o_proj-rms %.6g attn-rms(4096) %.6g "
-                "ratio %.3g\n", sqrt(o2 / H), sqrt(a2 / ocols),
+        fprintf(stderr, "[gqa] L%d o_proj-rms %.6g attn-rms(4096) %.6g "
+                "ratio %.3g\n", L, sqrt(o2 / H), sqrt(a2 / ocols),
                 sqrt(o2 / H) / (sqrt(a2 / ocols) + 1e-30f));
+        if (token == 1 && L == 7) {
+            FILE *gf = fopen("/tmp/q35-eng-gqa7.bin", "wb");
+            if (gf) {
+                fwrite(attn_out, sizeof(float), (size_t)ocols, gf);
+                fclose(gf);
+            }
+        }
     }
     for (int i = 0; i < H; i++) state[i] += o[i];
 

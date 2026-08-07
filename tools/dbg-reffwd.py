@@ -161,17 +161,20 @@ def embed_row(tokid):
 
 # ---- rope
 def rope_apply(qk, pos, rd):
-    """interleaved RoPE on first rd dims, theta from config.
-    mrope_interleaved: pairs (2i, 2i+1), inv_freq = 1/theta^(2i/rd)."""
+    """mlx nn.RoPE traditional=False on first rd dims: HALF-SPLIT pairs
+    (d, d+rd/2), NOT interleaved (2i, 2i+1). Verified against mx.fast.rope.
+    (mrope_interleaved in config is a transformers-ism; mlx-lm
+    qwen3_next.py uses initialize_rope(traditional=False).)
+    inv_freq = 1/theta^(2i/rd)."""
     out = qk.copy()
     for i in range(rd // 2):
         ang = pos / (THETA ** (2.0 * i / rd))
         c = math.cos(ang)
         s = math.sin(ang)
-        a = out[2 * i]
-        b = out[2 * i + 1]
-        out[2 * i] = a * c - b * s
-        out[2 * i + 1] = a * s + b * c
+        a = out[i]
+        b = out[i + rd // 2]
+        out[i] = a * c - b * s
+        out[i + rd // 2] = a * s + b * c
     return out
 
 # ---- linear-attn cache
@@ -292,6 +295,8 @@ for t in range(T):
                 w = w / w.sum()
                 outs[hi] = w @ Vs[:, khh]
             gated = outs * (1.0 / (1.0 + np.exp(-gate)))
+            if t == 1 and L == 7:
+                gated.astype(np.float32).tofile('/tmp/q35-ref-gqa7.bin')
             r = proj(layer, '.self_attn.o_proj', gated.reshape(-1), H)
             if t == 0 and L == 3:
                 print('L3 t0: q rms %.4g k rms %.4g v rms %.4g s max %.4g '
@@ -302,6 +307,10 @@ for t in range(T):
                     float(s.max()) if npos else -1,
                     float(np.sqrt((r**2).mean()))), flush=True)
         h = h + r
+        if (t == 1 and L in (3, 7)):
+            print('t1 L%d gqa: h rms %.4g r rms %.4g' % (
+                L, float(np.sqrt((h**2).mean())),
+                float(np.sqrt((r**2).mean()))), flush=True)
         if t == 0 and L == 3:
             print('L3 after-gqa: h rms %.4g r rms %.4g' % (
                 float(np.sqrt((h**2).mean())),
@@ -364,6 +373,9 @@ for t in range(T):
                 float(np.sqrt((acc**2).mean())),
                 float(np.sqrt((xin2**2).mean()))), flush=True)
         if (t == 0) and (L < 8):
+            print('t%d L%d state rms %.4g' % (t, L,
+                  float(np.sqrt((h**2).mean()))), flush=True)
+        if t == 1 and L < 8:
             print('t%d L%d state rms %.4g' % (t, L,
                   float(np.sqrt((h**2).mean()))), flush=True)
     # final norm
