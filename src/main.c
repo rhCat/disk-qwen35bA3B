@@ -380,6 +380,11 @@ int main(int argc, char **argv) {
             fprintf(stderr, "\n");
         } else if (prompt_ids) {
             char *dup = strdup(prompt_ids);
+            if (!dup) {
+                fprintf(stderr, "ds4f: strdup(prompt_ids) failed\n");
+                free(pids);
+                return 2;
+            }
             char *save = NULL;
             for (char *tok = strtok_r(dup, ",", &save); tok;
                  tok = strtok_r(NULL, ",", &save)) {
