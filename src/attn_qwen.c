@@ -104,10 +104,16 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     int kvlat = krows + vrows;
     if (kv->kvlat != kvlat && kv->kvlat != 0) return 0;
 
-    float *buf = (float *)calloc(
-        (size_t)(H + qrows + krows + vrows + orows + 2 * H + 1),
-        sizeof(float));
-    if (!buf) return -1;
+    if (getenv("DS4F_NAN_PROBE") && L == 3) {
+        fprintf(stderr, "[gqa] L%d enter scratch_n=%ld need=%d\n", L,
+                kv->scratch_n,
+                (int)(H + qrows + krows + vrows + orows + 2 * H + 1 +
+                      3 * heads * kh + 128 + 2 * kv->max_tokens));
+        fprintf(stderr, "[gqa] L%d orows=%d ocols=%d heads=%d kh=%d "
+                        "qrows=%d\n", L, orows, ocols, heads, kh, qrows);
+    }
+
+    float *buf = kv->scratch;   /* arena, sized at init (never per-call) */
     float *xin = buf;               /* input_layernorm(state) */
     float *q = xin + H;             /* qrows: q(16x256) + gate(16x256) */
     float *k = q + qrows;
@@ -138,20 +144,26 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     if (mlx4_proj(tl, qi, qs, qb, tr, qrows, qcols, xin, q) != 0 ||
         mlx4_proj(tl, ki, ks, kb, tr, krows, qcols, xin, k) != 0 ||
         mlx4_proj(tl, vi, vs, vb, tr, vrows, qcols, xin, v) != 0) {
-        free(buf);
+        /* buf is the shared arena (kv->scratch) -- never freed here */
         return -1;
     }
     /* split q | gate: q is the first 256 of each 512-head, gate the
      * rest. q_norm over the full 256-dim head. */
     const uint16_t *qwn = (const uint16_t *)(const void *)(tr + tl->t[qn].off);
     const uint16_t *kwn = (const uint16_t *)(const void *)(tr + tl->t[kn].off);
-    float *gate = (float *)calloc((size_t)heads * kh, sizeof(float));
-    float *qq = (float *)calloc((size_t)heads * kh, sizeof(float));
-    float *kk = (float *)calloc((size_t)heads * kh, sizeof(float));
-    if (!gate || !qq || !kk) {
-        free(gate); free(qq); free(kk); free(buf);
-        return -1;
-    }
+    /* arena slices (after buf): gate/qq/kk then cos/sin then
+     * scores/wgt -- all fixed offsets from kv->scratch, no per-call
+     * allocation. attn_out is ocols wide (16 heads x 256). */
+    float *gate = attn_out + ocols;
+    float *qq = gate + (size_t)heads * kh;
+    float *kk = qq + (size_t)heads * kh;
+    float *cos_t = kk + (size_t)heads * kh;         /* 64 floats */
+    float *sin_t = cos_t + 64;
+    float *scores = sin_t + 64;
+    float *wgt = scores + (size_t)kv->max_tokens;
+    memset(gate, 0, (size_t)heads * kh * sizeof(float));
+    memset(qq, 0, (size_t)heads * kh * sizeof(float));
+    memset(kk, 0, (size_t)heads * kh * sizeof(float));
     for (int h = 0; h < heads; h++) {
         float *hq = q + (size_t)h * qh;
         memcpy(qq + (size_t)h * kh, hq, (size_t)kh * sizeof(float));
@@ -168,13 +180,9 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     {
         int rd = (int)(kh * 0.25f);              /* 64 */
         double theta = 10000000.0;
-        float *cos_t = (float *)calloc((size_t)rd, sizeof(float));
-        float *sin_t = (float *)calloc((size_t)rd, sizeof(float));
-        if (!cos_t || !sin_t) {
-            free(cos_t); free(sin_t); free(gate); free(qq); free(kk);
-            free(buf);
-            return -1;
-        }
+        /* cos_t/sin_t are arena slices (defined with the other slices) */
+        memset(cos_t, 0, (size_t)rd * sizeof(float));
+        memset(sin_t, 0, (size_t)rd * sizeof(float));
         /* mrope_interleaved: dims 0..rd-1 get rope pairs (d, d+1) --
          * interleaved layout means pair (2i, 2i+1). inv_freq over
          * arange(0, rd, 2)/rd (the transformers rope init). */
@@ -206,8 +214,6 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 hk[i + rd / 2] = x0 * s + x1 * c;
             }
         }
-        free(cos_t);
-        free(sin_t);
     }
 
     /* write k/v into the cache at token */
@@ -217,13 +223,9 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
 
     /* attention: 16 q-heads over 2 kv-heads (repeat_kv 8), 0..token */
     float dscale = 1.0f / sqrtf((float)kh);
-    float *scores = (float *)calloc((size_t)kv->max_tokens, sizeof(float));
-    float *wgt = (float *)calloc((size_t)kv->max_tokens, sizeof(float));
-    if (!scores || !wgt) {
-        free(scores); free(wgt); free(gate); free(qq); free(kk);
-        free(buf);
-        return -1;
-    }
+    /* scores/wgt are arena slices (sized to max_tokens at init) */
+    memset(scores, 0, (size_t)kv->max_tokens * sizeof(float));
+    memset(wgt, 0, (size_t)kv->max_tokens * sizeof(float));
     memset(attn_out, 0, (size_t)orows * sizeof(float));
     int npos = token + 1;
     for (int h = 0; h < heads; h++) {
@@ -269,9 +271,6 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 attn_out[(size_t)h * kh + i] += w * v2[i];
         }
     }
-    free(scores);
-    free(wgt);
-
     /* gate: attn_out *= sigmoid(gate) */
     for (int h = 0; h < heads; h++) {
         const float *gh = gate + (size_t)h * kh;
@@ -323,14 +322,9 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             }
         }
     }
-    free(gate);
-    free(qq);
-    free(kk);
-
     /* o_proj(attn_out) -> o; residual add. attn_out is ocols wide
      * (16 heads x 256); o_proj is [orows=2048 x ocols=4096]. */
     if (mlx4_proj(tl, oi, os, ob, tr, orows, ocols, attn_out, o) != 0) {
-        free(buf);
         return -1;
     }
     if (getenv("DS4F_NAN_PROBE") && (L == 3 || L == 7)) {
@@ -358,7 +352,6 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     }
     for (int i = 0; i < H; i++) state[i] += o[i];
 
-    free(buf);
     return 0;
 }
 
@@ -443,17 +436,18 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
      * tokens (the causal conv reads the PREVIOUS qkv vectors) */
     float *conv_ring = kv->conv + (size_t)L * 4 * qkv_rows;
 
-    float *buf = (float *)calloc(
-        (size_t)(H + qkv_rows + z_rows + o_rows + v_heads * vd +
-                 v_heads * kd + 2 * H + 1),
-        sizeof(float));
-    if (!buf) return -1;
+    float *buf = kv->scratch;   /* arena, sized at init (never per-call) */
     float *xin = buf;               /* input_layernorm(state) */
     float *qkv = xin + H;
     float *z = qkv + qkv_rows;
     float *o = z + z_rows;
     float *readout = o + o_rows;              /* v_heads*vd */
     float *qk = readout + v_heads * vd;       /* k_heads*kd (q) + k */
+    /* NOTE: linear_step and gqa_step share kv->scratch. They are called
+     * sequentially (one per layer), so reuse is safe. */
+    memset(buf, 0, (size_t)(H + qkv_rows + z_rows + o_rows +
+                 v_heads * vd + v_heads * kd + 2 * H + 1) *
+                 sizeof(float));
 
     /* reference: x = x + GatedDeltaNet(input_layernorm(x)) */
     if (iln >= 0) {
@@ -475,7 +469,6 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
 
     if (mlx4_proj(tl, pi, ps, pb, tr, qkv_rows, cols, xin, qkv) != 0 ||
         mlx4_proj(tl, zi, zs, zb, tr, z_rows, cols, xin, z) != 0) {
-        free(buf);
         return -1;
     }
     float a32[32], b32[32];
@@ -483,7 +476,6 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         float tmp[32];
         if (mlx4_proj(tl, ai, as_, ab, tr, 32, cols, xin, tmp) != 0 ||
             mlx4_proj(tl, bi, bs_, bb, tr, 32, cols, xin, a32) != 0) {
-            free(buf);
             return -1;
         }
         memcpy(b32, a32, sizeof b32);        /* b = second proj result */
@@ -705,7 +697,6 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     /* out_proj(readout) -> o, residual add */
     if (mlx4_proj(tl, oi, os_, ob, tr, o_rows, v_heads * vd, readout, o)
         != 0) {
-        free(buf);
         return -1;
     }
     if (getenv("DS4F_NAN_PROBE") && L == 0 &&
@@ -758,7 +749,6 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     }
     for (int i = 0; i < H; i++) state[i] += o[i];
 
-    free(buf);
     return 0;
 }
 

@@ -418,6 +418,46 @@ int main(int argc, char **argv) {
             fprintf(stderr, "moe: kv cache init failed\n");
             return 2;
         }
+        /* per-token attention work arena: worst-case GQA need
+         *   buf(H+qrows+krows+vrows+orows+2H) + gate+qq+kk (3*heads*kh)
+         *   + cos/sin (2*64) + scores+wgt (2*max_tokens)
+         * and linear need
+         *   H+qkv_rows+z_rows+o_rows+v_heads*vd+v_heads*kd+2H.
+         * Compute the bound from the trunk dims and allocate ONCE --
+         * never malloc per layer/token (macOS zone high-water). */
+        {
+            long need = 1024;
+            int Hh = cfg.hidden;
+            for (int L2 = 0; L2 < cfg.n_layers; L2++) {
+                int qi = tl.q3_q[L2], pi = tl.q3_pqkv[L2];
+                if (qi >= 0) {
+                    int qrows = (int)tl.t[qi].dims[0];
+                    int ki = tl.q3_k[L2], vi = tl.q3_v[L2], oi = tl.q3_o[L2];
+                    int krows = ki >= 0 ? (int)tl.t[ki].dims[0] : 0;
+                    int vrows = vi >= 0 ? (int)tl.t[vi].dims[0] : 0;
+                    int orows = oi >= 0 ? (int)tl.t[oi].dims[0] : 0;
+                    long n = (long)Hh + qrows + krows + vrows + orows +
+                             2L * Hh + 1 + 3L * 4096 + 128 +
+                             2L * (npids + gen);
+                    if (n > need) need = n;
+                }
+                if (pi >= 0) {
+                    int qkv_rows = (int)tl.t[pi].dims[0];
+                    int zi = tl.q3_pz[L2], oi = tl.q3_opa[L2];
+                    int z_rows = zi >= 0 ? (int)tl.t[zi].dims[0] : 0;
+                    int o_rows = oi >= 0 ? (int)tl.t[oi].dims[0] : 0;
+                    long n = (long)Hh + qkv_rows + z_rows + o_rows +
+                             32L * 128 + 32L * 128 + 2L * Hh + 1;
+                    if (n > need) need = n;
+                }
+            }
+            if (ds4f_kv_scratch_init(&kvc, need) != 0) {
+                fprintf(stderr, "moe: kv scratch init failed\n");
+                return 2;
+            }
+            fprintf(stderr, "kv scratch: %ld floats (%.1f MB)\n", need,
+                    (double)need * 4.0 / 1048576.0);
+        }
         kv_ok = 1;
     }
 

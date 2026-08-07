@@ -569,6 +569,8 @@ typedef struct {
     const float *latent;
     float *out;               /* chain result, Lat floats */
     float *scratch;           /* max_rc floats, private */
+    float *cur, *tmp, *chain; /* per-fetch work buffers, preallocated by
+                                 the caller (never malloc per fetch) */
     int Lat, D;
     long scratch_n;
     int64_t n_matvec, n_decode;
@@ -577,13 +579,14 @@ typedef struct {
 
 static void *exp_run(void *arg) {
     ExpJob *j = (ExpJob *)arg;
-    /* calloc: the chain tail (clen < Lat) is stale after the last
-     * matvec; zero-init makes the combine deterministic regardless of
-     * heap layout (uninit tails caused run-to-run token variation on
-     * macOS, issue #6 step 5). */
-    float *cur = (float *)calloc((size_t)j->D, sizeof(float));
-    float *tmp = (float *)calloc((size_t)j->D, sizeof(float));
-    if (!cur || !tmp) { free(cur); free(tmp); j->fail = 1; return NULL; }
+    /* cur/tmp/chain come from the caller's preallocated buffers (never
+     * malloc per fetch). zero-init: the chain tail (clen < Lat) is stale
+     * after the last matvec; zero-init makes the combine deterministic
+     * regardless of heap layout. */
+    float *cur = j->cur;
+    float *tmp = j->tmp;
+    memset(cur, 0, (size_t)j->D * sizeof(float));
+    memset(tmp, 0, (size_t)j->D * sizeof(float));
     memcpy(cur, j->latent, (size_t)j->Lat * sizeof(float));
     long clen = j->Lat;
     if (j->el->chain == 1) {
@@ -605,8 +608,8 @@ static void *exp_run(void *arg) {
                                          * x=cur while writing y, so y
                                          * must not alias the input
                                          * (row-over-row corruption). */
-            float *chain = (float *)calloc((size_t)j->D, sizeof(float));
-            if (!chain) { free(cur); free(tmp); j->fail = 1; return NULL; }
+            float *chain = j->chain;   /* preallocated by caller */
+            memset(chain, 0, (size_t)j->D * sizeof(float));
             if (g->fmt == 1) {
                 const uint16_t *gb = g->rel_b >= 0
                     ? (const uint16_t *)(const void *)(j->slot + g->rel_b)
@@ -733,7 +736,6 @@ static void *exp_run(void *arg) {
             j->n_decode += j->Lat * M;
             memcpy(cur, tmp, (size_t)j->Lat * sizeof(float));
             clen = j->Lat;
-            free(chain);
             if (getenv("DS4F_NAN_PROBE") && _exp106_dumped &&
                 !_exp106_out_dumped) {
                 FILE *of = fopen("/tmp/q35-eng-expout.bin", "wb");
@@ -804,8 +806,6 @@ static void *exp_run(void *arg) {
     if (ncopy < j->Lat)
         memset(j->out + ncopy, 0,
                (size_t)(j->Lat - ncopy) * sizeof(float));
-    free(cur);
-    free(tmp);
     return NULL;
 }
 
@@ -1001,8 +1001,16 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     float *cur    = (float *)calloc((size_t)D, sizeof(float));
     float *out    = (float *)calloc((size_t)D, sizeof(float));
     float *acc    = (float *)calloc((size_t)D, sizeof(float));
-    if (!latent || !cur || !out || !acc) {
-        free(latent); free(cur); free(out); free(acc);
+    /* per-job work buffers (out + cur/tmp/chain), allocated once per
+     * call in ONE block -- never malloc per fetch (exp_run). Per job:
+     * out (Lat floats) + cur/tmp/chain (3 x D floats). */
+    int maxjob = cfg->topk > 64 ? 64 : cfg->topk;
+    if (maxjob < 1) maxjob = 1;
+    long perjob = (long)Lat + 3L * D;
+    float *jobbuf = (float *)calloc((size_t)maxjob * (size_t)perjob,
+                                    sizeof(float));
+    if (!latent || !cur || !out || !acc || !jobbuf) {
+        free(latent); free(cur); free(out); free(acc); free(jobbuf);
         return -1;
     }
     (void)cur;              /* expert chains now run in worker threads */
@@ -1041,21 +1049,23 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         jb->pool = pl;
         jb->slot = es[j];
         jb->latent = latent;
-        jb->out = (float *)calloc((size_t)Lat, sizeof(float));
+        jb->out = jobbuf + (size_t)njob * (size_t)perjob;
+        jb->cur  = jb->out + Lat;
+        jb->tmp  = jb->cur + D;
+        jb->chain = jb->tmp + D;
+        memset(jb->out, 0, (size_t)Lat * sizeof(float));
         /* job 0 reuses the caller's warm scratch; the rest come from
          * the caller's pool -- never malloc per call (page faults). */
         jb->scratch = (njob == 0) ? scratch : job_scratch[njob - 1];
         if (!jb->out || !jb->scratch) {
-            free(jb->out);           /* scratch is borrowed, never freed */
-            free(latent); free(cur); free(out); free(acc);
+            free(latent); free(cur); free(out); free(acc); free(jobbuf);
             return -1;
         }
         jb->Lat = Lat;
         jb->D = D;
         jb->scratch_n = scratch_n;
         if (pthread_create(&th[njob], NULL, exp_run, jb) != 0) {
-            free(jb->out); free(jb->scratch);
-            free(latent); free(cur); free(out); free(acc);
+            free(latent); free(cur); free(out); free(acc); free(jobbuf);
             return -1;
         }
         njob++;
@@ -1065,9 +1075,7 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     for (int j = 0; j < njob; j++) {
         ExpJob *jb = &job[j];
         if (jb->fail) {
-            for (int q = 0; q < njob; q++)
-                free(job[q].out);    /* scratch is borrowed */
-            free(latent); free(cur); free(out); free(acc);
+            free(latent); free(cur); free(out); free(acc); free(jobbuf);
             return -1;
         }
         *n_matvec += jb->n_matvec;
@@ -1098,8 +1106,9 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 acc[i] += wsel[j] * jb->out[i];
         }
     }
-    for (int j = 0; j < njob; j++)
-        free(job[j].out);            /* scratch is borrowed */
+    /* job[j].out are jobbuf slices; jobbuf freed at the end of the
+     * function. (The old code freed each out separately -- that was
+     * per-job malloc, now replaced by the single jobbuf block.) */
 
     /* shared expert (Qwen3.5): dense every-token MLP added after the
      * routed experts -- acc += sigmoid(shared_expert_gate(xin)) *
@@ -1323,6 +1332,6 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
 
     free(orig);
     free(xin);
-    free(latent); free(cur); free(out); free(acc);
+    free(latent); free(cur); free(out); free(acc); free(jobbuf);
     return 0;
 }

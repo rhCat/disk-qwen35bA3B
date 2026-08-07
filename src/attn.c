@@ -37,11 +37,25 @@ int ds4f_kv_init(Ds4fKvCache *c, int n_layers, int kvlat, int max_tokens) {
     return 0;
 }
 
+/* Per-token work arena for the attention paths: allocated ONCE with the
+ * exact worst-case float count (computed by the caller from the trunk
+ * dims). Removes ~1.1M malloc/free per 20K-token run -- macOS keeps
+ * freed large blocks at the zone high-water (~2.9 GB resident empty
+ * zones observed). */
+int ds4f_kv_scratch_init(Ds4fKvCache *c, long floats) {
+    if (!c || floats < 1) return -1;
+    c->scratch = (float *)malloc((size_t)floats * sizeof(float));
+    if (!c->scratch) return -1;
+    c->scratch_n = floats;
+    return 0;
+}
+
 void ds4f_kv_free(Ds4fKvCache *c) {
     if (!c) return;
     free(c->kv);
     free(c->lin);
     free(c->conv);
+    free(c->scratch);
     memset(c, 0, sizeof *c);
 }
 
