@@ -17,7 +17,7 @@ TRUNK="${1:-/tmp/q35-trunk}"
 POOL="${2:-/tmp/q35-pool}"
 GEN="${GEN:-4}"
 LIMIT="${LIMIT:-23}"
-CACHE_GB="${CACHE_GB:-2}"
+CACHE_GB="${CACHE_GB:-5}"
 DUMP="${DUMP:-}"
 
 TOK="${TOK:-/Users/ruihe/.cache/huggingface/mlx-qwen35-a3b-4bit/tokenizer.json}"

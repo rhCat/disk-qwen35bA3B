@@ -13,6 +13,6 @@ GEN=2 ./ds4f /tmp/q35-trunk \
   --head /tmp/q35-trunk/head.json \
   --embed /tmp/q35-trunk/embed.json \
   --pids-file /tmp/q35-prompt20k.txt \
-  --cache-gb 2 --pin-layers 4 --mem-limit-gb 20 \
+  --cache-gb 5 --pin-layers 4 --mem-limit-gb 20 \
   > /tmp/run20k.log 2>&1
 echo "EXIT $?" >> /tmp/run20k.log

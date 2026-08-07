@@ -38,7 +38,7 @@ static void usage(const char *argv0) {
         "  --pids-file FILE    read comma/space-separated token ids from a file\n"
         "  --tokenizer FILE    tokenizer.json (ids <-> text; decodes output)\n"
         "  --text S            prompt text, encoded via --tokenizer\n"
-        "  --cache-gb X        expert cache budget in GB       (default 2;\\n"
+        "  --cache-gb X        expert cache budget in GB       (default 5;\n"
         "                        env DS4F_CACHE_GB; CLI wins)\\n"
         "  --trunk-gb X        trunk pin budget in GB          (default 4)\n"
         "  --pin-layers N      explicit pinned trunk prefix    (default auto)\n"
@@ -83,7 +83,7 @@ int main(int argc, char **argv) {
     const char *head_path = NULL, *embed_path = NULL, *prompt_ids = NULL;
     const char *pids_file = NULL;
     const char *tok_path = NULL, *text_arg = NULL;
-    double cache_gb = 2.0, trunk_gb = 4.0, locality = 0.0;
+    double cache_gb = 5.0, trunk_gb = 4.0, locality = 0.0;
     double mem_limit_gb = 23.0;
     int pin_layers = -1, nring = 2, gen = 4, threads = 4, refuse = 1;
     /* DS4F_CACHE_GB env overrides the default (CLI --cache-gb still wins).
