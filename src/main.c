@@ -1090,6 +1090,21 @@ int main(int argc, char **argv) {
                     for (int i = 0; i < (int)head.dims[0]; i++)
                         logits[i] /= temp;
                 tokid = ds4f_sample(logits, (int)head.dims[0], &rng);
+            } else if (getenv("DS4F_TOP_P")) {
+                /* nucleus sampling: DS4F_TOP_P=0.9, optional
+                 * DS4F_TEMP for temperature scaling first */
+                const char *te = getenv("DS4F_TEMP");
+                double p = atof(getenv("DS4F_TOP_P"));
+                if (p <= 0.0) p = 0.9;
+                if (p > 1.0) p = 1.0;
+                if (te) {
+                    float temp = (float)atof(te);
+                    if (temp > 0.0f && temp != 1.0f)
+                        for (int i = 0; i < (int)head.dims[0]; i++)
+                            logits[i] /= temp;
+                }
+                tokid = ds4f_sample_topp(logits, (int)head.dims[0], p,
+                                         &rng, 512);
             }
             else
                 tokid = ds4f_sample(logits, (int)head.dims[0], &rng);

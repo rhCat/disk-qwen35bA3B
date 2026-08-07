@@ -5,6 +5,14 @@ Disk-streaming MoE inference **structure** in portable C99 for
 top-8; hybrid linear/full attention). No BLAS, no framework, no GPU,
 no dependencies beyond libc + pthreads.
 
+> **HARD RULE: never load the full model into RAM/VRAM.** The
+> disk-streaming design is the point — the ~21.7 GB of weights stay on
+> disk and only the 8 routed experts per token are fetched. Full-model
+> reference runs (e.g. loading the checkpoint wholesale into mlx/PyTorch
+> for comparison) are forbidden on development machines: they overload
+> memory. Compare against the reference only through the streaming path
+> or bit-fidelity probes (see `docs/fidelity-audit.md`).
+
 The systems architecture mirrors the family proven by
 [kimi-k3-in-c](https://github.com/FareedKhan-dev/kimi-k3-in-c),
 [Colibrì](https://github.com/JustVugg/colibri), and the author's

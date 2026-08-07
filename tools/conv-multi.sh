@@ -5,7 +5,7 @@
 set -u
 REPO=/Users/ruihe/disk-qwen35bA3B
 cd "$REPO"
-export DS4F_GREEDY=1 DS4F_REP_PENALTY=1.3 DS4F_DEBUG7=1
+export DS4F_TOP_P=0.9 DS4F_TEMP=0.8 DS4F_REP_PENALTY=1.15 DS4F_DEBUG7=1
 unset PYTHONPATH
 PY="$REPO/.venv/bin/python3"
 HFBASE="$(cd "$HOME/.cache" 2>/dev/null && pwd)/huggingface"
@@ -37,7 +37,7 @@ PYEOF
     --pool /tmp/q35-pool/pool.bin --layout-pool /tmp/q35-pool/manifest.json \
     --head /tmp/q35-trunk/head.json --embed /tmp/q35-trunk/embed.json \
     --tokenizer "$HFBASE/mlx-qwen35-a3b-4bit/tokenizer.json" \
-    --pids-file /tmp/conv-ids.txt --gen 48 \
+    --pids-file /tmp/conv-ids.txt --gen 128 \
     --cache-gb 5 --pin-layers 4 --mem-limit-gb 20 \
     > /tmp/conv-$tag.log 2>&1
   rc=$?

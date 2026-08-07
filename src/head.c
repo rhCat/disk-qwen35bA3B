@@ -419,3 +419,57 @@ int ds4f_sample(const float *logits, int V, uint64_t *rng) {
     free(w);
     return tok;
 }
+
+/* Nucleus (top-p) sampling with a bounded candidate window.
+ *
+ * logits in, p in (0,1]. Keeps the smallest set of top tokens whose
+ * cumulative softmax mass >= p and samples within it. The candidate
+ * window is capped at maxk (pass 0 for a safe default of 512): with a
+ * tight p (0.8-0.95) the nucleus is far smaller than the 248K vocab,
+ * which avoids the full-vocab softmax/malloc of ds4f_sample per token.
+ *
+ * Returns the sampled token id; falls back to argmax on allocation
+ * failure (never returns an invalid id). */
+int ds4f_sample_topp(const float *logits, int V, double p, uint64_t *rng,
+                     int maxk) {
+    if (V < 1) return 0;
+    if (maxk <= 0 || maxk > V) maxk = V < 512 ? V : 512;
+    /* collect the maxk highest-logit indices (partial selection) */
+    int *idx = (int *)malloc((size_t)maxk * sizeof(int));
+    float *w = (float *)malloc((size_t)maxk * sizeof(float));
+    if (!idx || !w) { free(idx); free(w); return ds4f_argmax(logits, V); }
+    for (int k = 0; k < maxk; k++) idx[k] = k;
+    /* simple insertion sort of the top maxk by logit (descending) */
+    for (int i = 0; i < maxk; i++) {
+        int best = i;
+        for (int j = i + 1; j < maxk; j++)
+            if (logits[idx[j]] > logits[idx[best]]) best = j;
+        int t = idx[i]; idx[i] = idx[best]; idx[best] = t;
+    }
+    float mx = logits[idx[0]];
+    double sum = 0.0;
+    int n = 0;
+    for (int k = 0; k < maxk; k++) {
+        double e = expf(logits[idx[k]] - mx);
+        sum += e;
+        w[k] = (float)e;
+        if (sum >= p) { n = k + 1; break; }
+    }
+    if (n < 1) n = maxk;
+    /* xorshift64 draw within the nucleus */
+    uint64_t x = *rng;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *rng = x;
+    double target = (double)(x >> 11) / 9007199254740992.0 * sum;
+    double acc = 0.0;
+    int tok = idx[0];
+    for (int k = 0; k < n; k++) {
+        acc += w[k];
+        if (target < acc) { tok = idx[k]; break; }
+    }
+    free(idx);
+    free(w);
+    return tok;
+}
