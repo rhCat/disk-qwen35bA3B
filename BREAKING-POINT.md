@@ -159,6 +159,15 @@ exit 0 (23 GB gate armed, never fired)
   noise accumulating through 40 layers (scales ~0.005), vs the
   reference's BF16. Structural work is complete; coherent prose is a
   quantization-fidelity question, not a wiring question.
+- **CONV1D TAP ORDER (2026-08-06): the linear-attention conv1d was
+  time-reversed.** My loop applied w[0] to the NEWEST sample; the
+  reference's causal_conv1d_update concatenates [x_{t-3},...,x_t] and
+  convolves w[0..3] so w[0] is the OLDEST tap. Fixed: tpos =
+  token-(K-1-k). With the fix the linear state accumulates across
+  tokens (state-rms 0.031 at token 6, v-rms 1.17) and the GQA
+  attention is sharp (top softmax weight 0.4-1.0 at generation
+  positions). Output now shows real English fragments ("Cont",
+  "daque", "Lastly") amid the quantization noise.
 
 ## Graceful stop (the guard)
 

@@ -242,6 +242,19 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             wgt[t2] = expf(scores[t2] - mx);
             sum += wgt[t2];
         }
+        if (getenv("DS4F_DEBUG_ATTN") && h == 0 && L == 3) {
+            float wmax = 0.0f;
+            int warg = -1;
+            for (int t2 = 0; t2 < npos; t2++) {
+                wgt[t2] /= sum;
+                if (wgt[t2] > wmax) { wmax = wgt[t2]; warg = t2; }
+            }
+            fprintf(stderr, "[attn] L%d t%d npos=%d topw=%.3f at pos %d "
+                    "score[0]=%.3f score[last]=%.3f\n", L, token, npos,
+                    wmax, warg, scores[0], scores[npos - 1]);
+        } else {
+            for (int t2 = 0; t2 < npos; t2++) wgt[t2] /= sum;
+        }
         for (int t2 = 0; t2 < npos; t2++) {
             const float *v2 = kv->kv +
                 ((size_t)L * kv->max_tokens + t2) * kvlat + krows +
@@ -427,7 +440,10 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     }
     /* causal conv1d (depthwise, kernel 4) with SILU activation. Weight
      * [8192, 4, 1] BF16, layout [channel][k][1]. Ring holds the past
-     * Q3_CONV_K qkv vectors. conv(x) = silu(sum_k w[k]*x[t-k]) */
+     * Q3_CONV_K qkv vectors. The reference's causal_conv1d_update
+     * concatenates [x_{t-3}, x_{t-2}, x_{t-1}, x_t] and convolves with
+     * w[0..3] -- so w[0] is the OLDEST tap and w[3] the newest.
+     * conv(x) = silu(sum_k w[k]*x[t-3+k]) */
     {
         const uint16_t *cw = (const uint16_t *)(const void *)(tr +
                               tl->t[ci].off);
@@ -436,7 +452,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         for (int ch = 0; ch < qkv_rows; ch++) {
             float acc = 0.0f;
             for (int k = 0; k < Q3_CONV_K; k++) {
-                int tpos = token - k;
+                int tpos = token - (Q3_CONV_K - 1 - k);   /* oldest..newest */
                 if (tpos < 0) continue;
                 int slot = (tpos % Q3_CONV_K) * qkv_rows + ch;
                 float w = bf16_f(cw[(size_t)ch * Q3_CONV_K + k]);
@@ -500,7 +516,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         double sm = 0.0;
         for (int i = 0; i < kd * vd; i++)
             if (S[i] == S[i]) sm += (double)S[i] * S[i];
-        if (L % 4 == 0)
+        if (L % 8 == 0 && token == 6)
             fprintf(stderr, "[lin] L%d pre-state rms %.6g\n", L, sqrt(sm));
     }
     for (int h = 0; h < v_heads; h++) {
@@ -537,7 +553,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 acc += Sh[(size_t)i * vd + j] * qh[i];
             oh[j] = acc;
         }
-        if (getenv("DS4F_NAN_PROBE") && L == 5 && h == 0) {
+        if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 6 && h == 0) {
             double sm = 0.0;
             for (int i = 0; i < kd * vd; i++)
                 if (Sh[i] == Sh[i]) sm += (double)Sh[i] * Sh[i];
