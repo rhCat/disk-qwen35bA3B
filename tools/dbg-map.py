@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+import sys, json, numpy as np
+
+def bf16arr(bits):
+    u = bits.astype(np.uint32) << 16
+    return u.view(np.float32)
+
+def decode(w, sc, bi):
+    w = w.astype(np.uint32)
+    sh = np.array([0, 4, 8, 12, 16, 20, 24, 28], dtype=np.uint32)
+    nib = (w[..., None] >> sh) & 0xF
+    R, P = w.shape
+    vals = nib.reshape(R, P * 8)
+    C = P * 8
+    G = C // 64
+    s = bf16arr(sc.astype(np.uint16)).reshape(R, G)
+    b = bf16arr(bi.astype(np.uint16)).reshape(R, G)
+    return vals.astype(np.float32) * np.repeat(s, 64, axis=1) + np.repeat(b, 64, axis=1)
+
+p = json.load(open('/tmp/q35-pool/manifest.json'))
+pb = open('/tmp/q35-pool/pool.bin', 'rb').read()
+EID = int(sys.argv[1])
+for t in p['tensors']:
+    if t['layer'] == 0 and t['expert'] == EID and t['name'] == 'gate_proj':
+        m = t
+        break
+w = np.frombuffer(pb, dtype=np.uint32, count=m['v_nbytes'] // 4,
+                  offset=m['v_off']).reshape(512, 256)
+s = np.frombuffer(pb, dtype=np.uint16, count=m['s_nbytes'] // 2,
+                  offset=m['s_off']).reshape(512, 32)
+b = np.frombuffer(pb, dtype=np.uint16, count=m['b_nbytes'] // 2,
+                  offset=m['b_off']).reshape(512, 32)
+xin = np.fromfile('/tmp/q35-ref-xin2.bin', dtype=np.float32)
+ref_g = decode(w, s, b) @ xin
+eng_g = np.fromfile('/tmp/q35-eng-gateup.bin', dtype=np.float32)[:512]
+print('expert', EID)
+nz = np.nonzero(eng_g != 0)[0]
+print('engine non-zero:', len(nz), 'ref non-zero:', int((ref_g != 0).sum()))
+# map engine index -> best ref index
+mapping = []
+for i in nz[:40]:
+    j = np.abs(ref_g - eng_g[i]).argmin()
+    mapping.append((int(i), int(j)))
+print('mapping (eng idx -> ref idx):', mapping[:20])
+# look for a systematic pattern: j - i, j % 64, j // 64 vs i
+d = [(j - i) % 512 for i, j in mapping]
+print('j-i mod 512 (first 20):', d[:20])
+print('i mod 64 (first 12):', [i % 64 for i, _ in mapping[:12]])
+print('j mod 64 (first 12):', [j % 64 for _, j in mapping[:12]])
+print('i//64 (first 12):', [i // 64 for i, _ in mapping[:12]])
+print('j//64 (first 12):', [j // 64 for _, j in mapping[:12]])

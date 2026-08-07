@@ -17,9 +17,12 @@ TRUNK="${1:-/tmp/q35-trunk}"
 POOL="${2:-/tmp/q35-pool}"
 GEN="${GEN:-4}"
 LIMIT="${LIMIT:-23}"
+DUMP="${DUMP:-}"
 
 TOK="${TOK:-/Users/ruihe/.cache/huggingface/mlx-qwen35-a3b-4bit/tokenizer.json}"
 echo "=== real-scale run: trunk $TRUNK, pool $POOL, gen $GEN, limit ${LIMIT}GB ==="
+DUMPARG=()
+if [ -n "$DUMP" ]; then DUMPARG=(--dump-state "$DUMP"); fi
 "$REPO_ROOT/ds4f" "$TRUNK" \
   --trunk "$TRUNK/trunk.bin" --offsets "$TRUNK/trunk.offsets" \
   --pool "$POOL/pool.bin" \
@@ -28,7 +31,8 @@ echo "=== real-scale run: trunk $TRUNK, pool $POOL, gen $GEN, limit ${LIMIT}GB =
   --head "$TRUNK/head.json" --embed "$TRUNK/embed.json" \
   --tokenizer "$TOK" --text "${PROMPT:-The capital of France is}" \
   --gen "$GEN" --cache-gb 2 --pin-layers 4 \
-  --mem-limit-gb "$LIMIT" \
+  --mem-limit-gb "$LIMIT" ${DUMPARG[@]+"${DUMPARG[@]}"} \
+  ${NOSIMD:+--no-simd} \
   > /tmp/q35-run.log 2>&1
 rc=$?
 echo "exit: $rc"

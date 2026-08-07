@@ -449,6 +449,18 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                               tl->t[ci].off);
         int base = (token % Q3_CONV_K) * qkv_rows;
         memcpy(conv_ring + base, qkv, (size_t)qkv_rows * sizeof(float));
+        if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 0) {
+            FILE *pf = fopen("/tmp/q35-eng-qkvpre.bin", "wb");
+            if (pf) {
+                fwrite(qkv, sizeof(float), (size_t)qkv_rows, pf);
+                fclose(pf);
+            }
+            fprintf(stderr, "[convw] ci=%d off=%zu cw[0..7]=%.6g %.6g %.6g %.6g "
+                    "%.6g %.6g %.6g %.6g\n", ci,
+                    (size_t)tl->t[ci].off,
+                    bf16_f(cw[0]), bf16_f(cw[1]), bf16_f(cw[2]), bf16_f(cw[3]),
+                    bf16_f(cw[4]), bf16_f(cw[5]), bf16_f(cw[6]), bf16_f(cw[7]));
+        }
         for (int ch = 0; ch < qkv_rows; ch++) {
             float acc = 0.0f;
             for (int k = 0; k < Q3_CONV_K; k++) {
@@ -462,9 +474,12 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             qkv[ch] = acc * sig;             /* silu */
         }
     }
-    /* q = qkv[0:2048], k = qkv[2048:4096], v = qkv[4096:8192].
-     * l2norm q and k per key head (repeat_interleave handled at use:
-     * value head h uses key head h/2). */
+    /* q/k normalization, EXACTLY the reference (qwen3_5.py):
+     *   inv_scale = kd^-0.5
+     *   q = inv_scale^2 * rms_norm(q, None, 1e-6)   (eps on the MEAN)
+     *   k = inv_scale   * rms_norm(k, None, 1e-6)
+     * rms_norm: x / sqrt(mean(x^2) + 1e-6) -- NOT l2norm on the sum;
+     * the eps placement matters for small-norm heads. */
     {
         for (int h = 0; h < k_heads; h++) {
             float *qh = qkv + (size_t)h * kd;
@@ -474,12 +489,12 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 double ss = 0.0;
                 for (int i = 0; i < kd; i++)
                     ss += (double)vec[i] * vec[i];
-                float inv = 1.0f / (sqrtf((float)ss + 1e-6f));
-                for (int i = 0; i < kd; i++) vec[i] *= inv;
+                float rms = sqrtf((float)(ss / (double)kd) + 1e-6f);
+                float scale = which ? (1.0f / sqrtf((float)kd))   /* k */
+                                     : (1.0f / (float)kd);        /* q */
+                for (int i = 0; i < kd; i++)
+                    vec[i] = vec[i] / rms * scale;
             }
-            /* q scaled by 1/sqrt(kd) after l2norm (the kernel's scale) */
-            float qs = 1.0f / sqrtf((float)kd);
-            for (int i = 0; i < kd; i++) qh[i] *= qs;
         }
     }
     /* log-decay per value head: g = -exp(A_log) * softplus(a + dt_bias) */
@@ -584,10 +599,35 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             for (int i = 0; i < vd; i++)
                 ss += (double)oh[i] * oh[i];
             float r = sqrtf((float)(ss / (double)vd) + 1e-6f);
+            if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 0 && h == 0)
+                fprintf(stderr, "[norm] L0 t0 h0 pre-r=%.6g first=%.6g\n",
+                        r, oh[0]);
+            if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 0 && h == 0 &&
+                getenv("DS4F_DUMP_Z")) {
+                FILE *rf = fopen("/tmp/q35-eng-readout.bin", "wb");
+                if (rf) {
+                    fwrite(readout, sizeof(float),
+                           (size_t)v_heads * vd, rf);
+                    fclose(rf);
+                }
+            }
             for (int i = 0; i < vd; i++) {
                 float zv = zh[i];
                 float sig = 1.0f / (1.0f + expf(-zv));
                 oh[i] = oh[i] / r * bf16_f(nw[i]) * (zv * sig);
+            }
+            if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 0 && h == 0) {
+                double hn = 0.0;
+                for (int i = 0; i < vd; i++)
+                    hn += (double)oh[i] * oh[i];
+                fprintf(stderr, "[norm] h0 post-rms %.6g oh[0..3] %.6g %.6g "
+                        "%.6g %.6g\n", sqrt(hn / vd), oh[0], oh[1], oh[2],
+                        oh[3]);
+                fprintf(stderr, "[norm] h0 zh[0..3] %.6g %.6g %.6g %.6g "
+                        "zh[64..67] %.6g %.6g %.6g %.6g zh[124..127] %.6g "
+                        "%.6g %.6g %.6g\n", zh[0], zh[1], zh[2], zh[3],
+                        zh[64], zh[65], zh[66], zh[67],
+                        zh[124], zh[125], zh[126], zh[127]);
             }
         }
     }
@@ -596,6 +636,45 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         != 0) {
         free(buf);
         return -1;
+    }
+    if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 0) {
+        double r2 = 0.0, z2 = 0.0, o2 = 0.0, q2 = 0.0;
+        for (int i = 0; i < v_heads * vd; i++) {
+            r2 += (double)readout[i] * readout[i];
+            z2 += (double)z[i] * z[i];
+        }
+        for (int i = 0; i < H; i++) o2 += (double)o[i] * o[i];
+        for (int i = 0; i < k_heads * kd; i++) q2 += (double)qkv[i] * qkv[i];
+        if (getenv("DS4F_DUMP_Z")) {
+            FILE *zf = fopen("/tmp/q35-eng-qkv.bin", "wb");
+            if (zf) {
+                fwrite(qkv, sizeof(float), (size_t)qkv_rows, zf);
+                fclose(zf);
+            }
+            FILE *bf = fopen("/tmp/q35-eng-ab.bin", "wb");
+            if (bf) {
+                fwrite(a32, sizeof(float), 32, bf);
+                fwrite(b32, sizeof(float), 32, bf);
+                fclose(bf);
+            }
+        }
+        /* per-head r of head 0 */
+        double h0 = 0.0;
+        for (int i = 0; i < vd; i++) h0 += (double)readout[i] * readout[i];
+        fprintf(stderr, "[linout] L%d t%d readout-rms %.6g z-rms %.6g "
+                "o-rms %.6g q-pre rms %.6g head0-r %.6g nw0..3 %.4g %.4g %.4g %.4g "
+                "z[0..3] %.4g %.4g %.4g %.4g silu-z[0..3] %.4g %.4g %.4g %.4g\n",
+                L, token,
+                sqrt(r2 / (v_heads * vd)), sqrt(z2 / (v_heads * vd)),
+                sqrt(o2 / H), sqrt(q2 / (k_heads * kd)),
+                sqrt(h0 / (double)vd),
+                bf16_f(((const uint16_t *)(const void *)(tr + tl->t[ni].off))[0]),
+                bf16_f(((const uint16_t *)(const void *)(tr + tl->t[ni].off))[1]),
+                bf16_f(((const uint16_t *)(const void *)(tr + tl->t[ni].off))[2]),
+                bf16_f(((const uint16_t *)(const void *)(tr + tl->t[ni].off))[3]),
+                z[0], z[1], z[2], z[3],
+                z[0]/(1+expf(-z[0])), z[1]/(1+expf(-z[1])),
+                z[2]/(1+expf(-z[2])), z[3]/(1+expf(-z[3])));
     }
     for (int i = 0; i < H; i++) state[i] += o[i];
 

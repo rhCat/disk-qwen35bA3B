@@ -27,6 +27,11 @@ static char *read_file(const char *path, long *len_out) {
     return buf;
 }
 
+static int _moeacc0_dumped = 0;
+static int _exp106_dumped = 0;
+static int _exp106_out_dumped = 0;
+static pthread_mutex_t _expdump_mu = PTHREAD_MUTEX_INITIALIZER;
+
 static int dtype_of(const char *s, size_t n) {
     if (n == 3 && !memcmp(s, "F32", 3)) return 0;
     if (n == 2 && !memcmp(s, "I8", 2)) return 1;
@@ -561,6 +566,7 @@ void ds4f_topk(const float *scores, int E, int k, int *idx, float *w) {
  * order in the caller, so results are bit-identical to the serial path. */
 typedef struct {
     const Ds4fExpertLayout *el;
+    const Ds4fPoolLayout *pool;
     const uint8_t *slot;
     const float *latent;
     float *out;               /* chain result, Lat floats */
@@ -596,7 +602,11 @@ static void *exp_run(void *arg) {
             d->dims[1] == g->dims[0] && d->dims[0] == j->Lat) {
             long M = g->dims[0];
             float *gx = tmp;            /* gate(x), M floats */
-            float *ux = cur;            /* up(x), M floats (reuse cur) */
+            float *ux = tmp + M;        /* up(x), M floats -- SEPARATE
+                                         * from cur: the matvec reads
+                                         * x=cur while writing y, so y
+                                         * must not alias the input
+                                         * (row-over-row corruption). */
             float *chain = (float *)calloc((size_t)j->D, sizeof(float));
             if (!chain) { free(cur); free(tmp); j->fail = 1; return NULL; }
             if (g->fmt == 1) {
@@ -629,6 +639,51 @@ static void *exp_run(void *arg) {
                 float s = gx[i];
                 float sig = 1.0f / (1.0f + expf(-s));
                 chain[i] = s * sig * ux[i];
+            }
+            if (getenv("DS4F_NAN_PROBE")) {
+                pthread_mutex_lock(&_expdump_mu);
+                if (!_exp106_dumped) {
+                    long eidx = j->el - j->pool->exp;
+                    int eid = (int)(eidx % j->pool->n_experts);
+                FILE *cf = fopen("/tmp/q35-eng-chain.bin", "wb");
+                if (cf) {
+                    fwrite(&eid, sizeof(int), 1, cf);
+                    fwrite(chain, sizeof(float), (size_t)M, cf);
+                    fclose(cf);
+                }
+                FILE *gf = fopen("/tmp/q35-eng-gateup.bin", "wb");
+                if (gf) {
+                    fwrite(&eid, sizeof(int), 1, gf);
+                    fwrite(gx, sizeof(float), (size_t)M, gf);
+                    fwrite(ux, sizeof(float), (size_t)M, gf);
+                    fclose(gf);
+                }
+                fprintf(stderr, "[expdump] expert %d\n", eid);
+                {
+                    FILE *lf = fopen("/tmp/q35-eng-latent.bin", "wb");
+                    if (lf) {
+                        fwrite(j->latent, sizeof(float),
+                               (size_t)j->Lat, lf);
+                        fclose(lf);
+                    }
+                }
+                {
+                    /* first gate weight words + scales for offset check */
+                    const uint32_t *w0 = (const uint32_t *)(const void *)
+                        (j->slot + g->rel_v);
+                    const uint16_t *s0 = (const uint16_t *)(const void *)
+                        (j->slot + g->rel_s);
+                    fprintf(stderr, "[expw] rel_v=%ld rel_s=%ld "
+                            "dims=[%ld,%ld] Lat=%d "
+                            "w0=%08x %08x %08x %08x s0=%04x %04x %04x %04x\n",
+                            (long)g->rel_v, (long)g->rel_s,
+                            (long)g->dims[0], (long)g->dims[1], j->Lat,
+                            w0[0], w0[1], w0[2], w0[3],
+                            s0[0], s0[1], s0[2], s0[3]);
+                }
+                _exp106_dumped = 1;
+                }
+                pthread_mutex_unlock(&_expdump_mu);
             }
             if (getenv("DS4F_NAN_PROBE") && j->latent &&
                 j->latent[0] != j->latent[0]) { /* NaN latent? */
@@ -663,6 +718,15 @@ static void *exp_run(void *arg) {
             memcpy(cur, tmp, (size_t)j->Lat * sizeof(float));
             clen = j->Lat;
             free(chain);
+            if (getenv("DS4F_NAN_PROBE") && _exp106_dumped &&
+                !_exp106_out_dumped) {
+                FILE *of = fopen("/tmp/q35-eng-expout.bin", "wb");
+                if (of) {
+                    fwrite(cur, sizeof(float), (size_t)j->Lat, of);
+                    fclose(of);
+                }
+                _exp106_out_dumped = 1;
+            }
         } else {
             /* shape mismatch: fall through to the sequential path so
              * the run still completes (garbage, but not a crash) */
@@ -958,6 +1022,7 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         ExpJob *jb = &job[njob];
         memset(jb, 0, sizeof *jb);
         jb->el = &pl->exp[(size_t)L * pl->n_experts + sel[j]];
+        jb->pool = pl;
         jb->slot = es[j];
         jb->latent = latent;
         jb->out = (float *)calloc((size_t)Lat, sizeof(float));
@@ -998,6 +1063,14 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         for (int j = 0; j < cfg->topk; j++) {
             if (!es[j]) continue;
             ExpJob *jb = &job[sj++];
+            if (getenv("DS4F_NAN_PROBE") && L == 0 && !_exp106_dumped) {
+                FILE *ef = fopen("/tmp/q35-eng-exp106.bin", "wb");
+                if (ef) {
+                    fwrite(jb->out, sizeof(float), (size_t)Lat, ef);
+                    fclose(ef);
+                }
+                _exp106_dumped = 1;
+            }
             if (getenv("DS4F_DEBUG_CHAIN") && L < 3) {
                 double o2 = 0.0;
                 for (int i = 0; i < Lat; i++)
@@ -1043,7 +1116,7 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             for (long i = 0; i < M; i++) {
                 float s = sg[i];
                 float sig = 1.0f / (1.0f + expf(-s));
-                chain[i] = sig * upv[i];     /* silu(gate)*up */
+                chain[i] = s * sig * upv[i];     /* silu(gate)*up */
             }
             ds4f_mlx4_matvec((const uint32_t *)(const void *)
                                  (tr + tl->t[tl->se_d[L]].off),
@@ -1084,6 +1157,19 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         fprintf(stderr, "[moeacc] L%d xin-rms %.6g acc-rms %.6g "
                 "gain %.6g\n", L, sqrt(i2 / H), sqrt(a2 / H),
                 sqrt(a2 / H) / (sqrt(i2 / H) + 1e-30f));
+        if (L == 0 && !_moeacc0_dumped) {
+            FILE *af = fopen("/tmp/q35-eng-moeacc0.bin", "wb");
+            if (af) {
+                fwrite(acc, sizeof(float), (size_t)H, af);
+                fclose(af);
+            }
+            FILE *xf = fopen("/tmp/q35-eng-xin0.bin", "wb");
+            if (xf) {
+                fwrite(xin, sizeof(float), (size_t)H, xf);
+                fclose(xf);
+            }
+            _moeacc0_dumped = 1;
+        }
     }
 
     /* state = state + W_up * acc (mHC: streams = B*orig + C*F) */

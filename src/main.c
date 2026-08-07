@@ -484,10 +484,21 @@ int main(int argc, char **argv) {
         } else if (text_mode) {
             ds4f_embed_gather(&embed, pids[t], state);
             if (getenv("DS4F_NAN_PROBE") && t == 0) {
+                fprintf(stderr, "[emb] t=%d npids=%d pids[0..5]=%d %d %d %d %d %d "
+                        "gathered=%d\n", t, npids, pids[0], pids[1], pids[2],
+                        pids[3], pids[4], pids[5], pids[t]);
                 double em = 0.0;
                 for (int i = 0; i < cfg.hidden; i++)
                     em += (double)state[i] * state[i];
-                fprintf(stderr, "[emb] rms %.6g\n", sqrt(em / cfg.hidden));
+                fprintf(stderr, "[emb] rms %.6g tok %d\n",
+                        sqrt(em / cfg.hidden), pids[t]);
+                if (getenv("DS4F_DUMP_EMBED")) {
+                    FILE *ef = fopen("/tmp/q35-eng-embed.bin", "wb");
+                    if (ef) {
+                        fwrite(state, sizeof(float), (size_t)cfg.hidden, ef);
+                        fclose(ef);
+                    }
+                }
             }
         }
         if (moe_mode) {
@@ -582,6 +593,26 @@ int main(int argc, char **argv) {
                 /* the ffn router sees the mHC layer input (A-combined
                  * streams) when the checkpoint has hc_ffn tensors */
                 const float *rstate = state;
+                if (tl.ffn_norm[L] >= 0 && !getenv("DS4F_NO_NORMS")) {
+                    /* the router sees post_attention_layernorm(state),
+                     * exactly like the expert input in moe_step */
+                    memcpy(xin_buf, state,
+                           (size_t)cfg.hidden * sizeof(float));
+                    double sn = 0.0;
+                    for (int i = 0; i < cfg.hidden; i++)
+                        sn += (double)xin_buf[i] * xin_buf[i];
+                    float rn = sqrtf((float)(sn / (double)cfg.hidden) +
+                                     1e-6f);
+                    const uint16_t *pnw = (const uint16_t *)(const void *)(
+                        tr + tl.t[tl.ffn_norm[L]].off);
+                    for (int i = 0; i < cfg.hidden; i++) {
+                        uint32_t pb2 = (uint32_t)pnw[i] << 16;
+                        float pw;
+                        memcpy(&pw, &pb2, 4);
+                        xin_buf[i] = xin_buf[i] / rn * pw;
+                    }
+                    rstate = xin_buf;
+                }
                 if (tl.hc_ffn_fn[L] >= 0) {
                     float A[8], C[8], B[64];
                     int nhc = 1;
@@ -637,6 +668,12 @@ int main(int argc, char **argv) {
                         (const float *)(const void *)(tr + gt->off), gbias,
                         cfg.n_experts, cfg.hidden, rstate, scores);
                 ds4f_topk(scores, cfg.n_experts, cfg.topk, idx, w);
+                if (getenv("DS4F_NAN_PROBE") && L < 3) {
+                    fprintf(stderr, "[rtop] L%d sel=%d %d %d %d %d %d %d %d "
+                            "w=%.4g %.4g %.4g %.4g\n", L, idx[0], idx[1],
+                            idx[2], idx[3], idx[4], idx[5], idx[6], idx[7],
+                            w[0], w[1], w[2], w[3]);
+                }
                 if (getenv("DS4F_DEBUG4")) {
                     uint64_t ck = ds4f_mix64(0);
                     double s2 = 0.0;
