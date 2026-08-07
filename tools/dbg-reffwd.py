@@ -4,11 +4,31 @@
 # with the CORRECT mlx4 dequant (q*s+b) and the shared expert.
 # Dumps the hidden state after the 6-token prompt for comparison with
 # the engine's --dump-state.
-import json, struct, math, sys
+import json, struct, math, sys, os, fcntl
 import numpy as np
 
 TRUNK = '/tmp/q35-trunk'
 POOL = '/tmp/q35-pool'
+
+def nocache_open(path):
+    """Open with F_NOCACHE (macOS) so pread doesn't balloon page cache,
+    mirroring the engine's st.c/trunk.c. Returns an fd."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+    except (AttributeError, OSError):
+        pass
+    return fd
+
+def pread_buf(fd, nbytes, offset):
+    """Read exactly nbytes at offset (positional, no fd state change)."""
+    out = bytearray()
+    while len(out) < nbytes:
+        chunk = os.pread(fd, nbytes - len(out), offset + len(out))
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
 
 def bf16arr(bits):
     u = bits.astype(np.uint32) << 16
@@ -47,9 +67,9 @@ def softplus(x):
 tl = json.load(open(TRUNK + '/trunk.json'))
 offs_all = np.fromfile(TRUNK + '/trunk.offsets', dtype=np.uint64)
 offs = offs_all[1::2]        # every other u64 = layer offset
-tb = open(TRUNK + '/trunk.bin', 'rb').read()
+tb_fd = nocache_open(TRUNK + '/trunk.bin')
 pool = json.load(open(POOL + '/manifest.json'))
-pb = open(POOL + '/pool.bin', 'rb').read()
+pb_fd = nocache_open(POOL + '/pool.bin')
 
 def tens(layer, suffix):
     for x in layer['tensors']:
@@ -63,12 +83,13 @@ def ten_arr(layer, suffix):
         return None
     base = int(offs[layer['layer']]) + x['off']
     dt = x['dtype']
+    buf = pread_buf(tb_fd, x['nbytes'], base)
     if dt == 'U32':
-        a = np.frombuffer(tb, dtype=np.uint32, count=x['nbytes'] // 4, offset=base)
+        a = np.frombuffer(buf, dtype=np.uint32, count=x['nbytes'] // 4)
     elif dt == 'BF16':
-        a = np.frombuffer(tb, dtype=np.uint16, count=x['nbytes'] // 2, offset=base)
+        a = np.frombuffer(buf, dtype=np.uint16, count=x['nbytes'] // 2)
     elif dt == 'F32':
-        a = np.frombuffer(tb, dtype=np.float32, count=x['nbytes'] // 4, offset=base)
+        a = np.frombuffer(buf, dtype=np.float32, count=x['nbytes'] // 4)
     else:
         return None
     return a.reshape(x['shape'])
@@ -102,12 +123,12 @@ def exp_tensor(L, e, proj_name):
             meta = t
             break
     assert meta is not None, (L, e, proj_name)
-    w = np.frombuffer(pb, dtype=np.uint32, count=meta['v_nbytes'] // 4,
-                      offset=meta['v_off'])
-    s = np.frombuffer(pb, dtype=np.uint16, count=meta['s_nbytes'] // 2,
-                      offset=meta['s_off'])
-    b = np.frombuffer(pb, dtype=np.uint16, count=meta['b_nbytes'] // 2,
-                      offset=meta['b_off'])
+    w = np.frombuffer(pread_buf(pb_fd, meta['v_nbytes'], meta['v_off']),
+                      dtype=np.uint32, count=meta['v_nbytes'] // 4)
+    s = np.frombuffer(pread_buf(pb_fd, meta['s_nbytes'], meta['s_off']),
+                      dtype=np.uint16, count=meta['s_nbytes'] // 2)
+    b = np.frombuffer(pread_buf(pb_fd, meta['b_nbytes'], meta['b_off']),
+                      dtype=np.uint16, count=meta['b_nbytes'] // 2)
     # manifest stores DECODED shape [R, C]; packed cols = C/8
     R, C = meta['shape']
     w = w.reshape(R, C // 8)
@@ -138,22 +159,22 @@ VD = 128   # linear value head dim
 HEADS = 16 # GQA q heads
 RDD = 64   # rotary dims (partial 0.25 * 256)
 
-# ---- prompt (the engine's actual ids: "The capital of France is" ->
-# 760 6511 314 9338 369 -- the engine's "prompt ids: 5 ..." is COUNT=5)
-pids = [760, 6511, 314, 9338, 369, 35]
+# ---- prompt (8 prompt tokens + the engine's 1st GENERATED token.
+# The engine's t7 logits argmax = 48017 Jupiter; it feeds Jupiter at t8.)
+pids = [760, 7526, 11247, 303, 279, 12570, 1785, 369, 48017]
 T = len(pids)
 print('prompt tokens:', pids)
 
 # ---- embed
 e = json.load(open(TRUNK + '/embed.json'))
-eb = open(TRUNK + '/embed.bin', 'rb').read()
+eb_fd = nocache_open(TRUNK + '/embed.bin')
 def embed_row(tokid):
-    w = np.frombuffer(eb, dtype=np.uint32, count=e['weight']['nbytes'] // 4,
-                      offset=e['weight']['off'])
-    sc = np.frombuffer(eb, dtype=np.uint16, count=e['scale']['nbytes'] // 2,
-                       offset=e['scale']['off'])
-    bi = np.frombuffer(eb, dtype=np.uint16, count=e['bias']['nbytes'] // 2,
-                       offset=e['bias']['off'])
+    w = np.frombuffer(pread_buf(eb_fd, e['weight']['nbytes'], e['weight']['off']),
+                      dtype=np.uint32, count=e['weight']['nbytes'] // 4)
+    sc = np.frombuffer(pread_buf(eb_fd, e['scale']['nbytes'], e['scale']['off']),
+                       dtype=np.uint16, count=e['scale']['nbytes'] // 2)
+    bi = np.frombuffer(pread_buf(eb_fd, e['bias']['nbytes'], e['bias']['off']),
+                       dtype=np.uint16, count=e['bias']['nbytes'] // 2)
     row = w[tokid * (2048 // 8):(tokid + 1) * (2048 // 8)]
     sc_r = sc[tokid * 32:(tokid + 1) * 32]
     bi_r = bi[tokid * 32:(tokid + 1) * 32]
@@ -181,6 +202,8 @@ def rope_apply(qk, pos, rd):
 lin_state = {}   # L -> [32, 128, 128]
 conv_cache = {}  # L -> list of past qkv vectors (max 3)
 kv_cache = {}    # L -> [pos, 2, 256] (k and v per kv head)
+printed_l0_delta = False
+printed_qkv = False
 
 x = np.zeros((T, H), dtype=np.float32)
 for t in range(T):
@@ -223,6 +246,14 @@ for t in range(T):
                 print('L0 t0: postconv rms %.4g' % (
                     float(np.sqrt((qkv**2).mean()))), flush=True)
             conv_cache[L] = seq[-3:]
+            if t == 8 and L == 0 and not printed_qkv:
+                print('ref L0 t8 preconv: q-slice rms %.4g k-slice rms %.4g '
+                      'v-slice rms %.4g  v[0..3] %s' % (
+                          float(np.sqrt((qkv[:2048]**2).mean())),
+                          float(np.sqrt((qkv[2048:4096]**2).mean())),
+                          float(np.sqrt((qkv[4096:]**2).mean())),
+                          np.round(qkv[4096:4100], 4).tolist()), flush=True)
+                printed_qkv = True
             # split q/k/v
             qq = qkv[0:2048].reshape(16, KD)
             kk = qkv[2048:4096].reshape(16, KD)
@@ -249,6 +280,16 @@ for t in range(T):
                 S[hv] += np.outer(kk[hk], delta)
                 readout[hv] = S[hv].T @ qq[hk]
             lin_state[L] = S
+            if t == 8 and L == 0 and not printed_l0_delta:
+                print('ref L0 t8: g[:3]=%s beta[:3]=%s k-rms %.4g '
+                      'q-rms %.4g v-rms %.4g state-rms %.4g' % (
+                          ['%.4g' % v for v in g[:3]],
+                          ['%.4g' % v for v in beta[:3]],
+                          float(np.sqrt((kk**2).mean())),
+                          float(np.sqrt((qq**2).mean())),
+                          float(np.sqrt((vv**2).mean())),
+                          float(np.sqrt((S**2).mean()))), flush=True)
+                printed_l0_delta = True
             # RMSNormGated: rmsnorm PER-HEAD with learned weight * silu(z)
             nwgt = ten_float(layer, '.linear_attn.norm.weight')
             rout = rmsnorm(readout.reshape(32, VD), nwgt, 1e-6).reshape(-1)
@@ -366,6 +407,16 @@ for t in range(T):
         if (t == 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1)) or (t > 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1)):
             print('t%d L%d state rms %.4g' % (t, L,
                   float(np.sqrt((h**2).mean()))), flush=True)
+        if t == 8 and L % 4 == 0:
+            h.astype(np.float32).tofile('/tmp/q35-ref-L%d-t8.bin' % L)
+            if L == 0:
+                print('dumping ref per-layer t8', flush=True)
+        if t == 7 and L % 4 == 0:
+            h.astype(np.float32).tofile('/tmp/q35-ref-L%d-t7.bin' % L)
+        if t == 7 and L == N_LAYERS - 1:
+            h.astype(np.float32).tofile('/tmp/q35-ref-L39-t7.bin')
+        if L == 0:
+            h.astype(np.float32).tofile('/tmp/q35-ref-L0-t%d.bin' % t)
         if t == 0 and L == 0:
             acc.astype(np.float32).tofile('/tmp/q35-ref-moeacc0.bin')
         if t == 0 and L == 0:
@@ -391,6 +442,7 @@ for t in range(T):
         print('t%d L%d state rms %.4g' % (t, L, float(np.sqrt((h**2).mean()))),
               flush=True)
     out_states.append(h_pre)   # PRE-final-norm (engine dumps pre-norm)
+    h.astype(np.float32).tofile('/tmp/q35-ref-postnorm.bin')  # POST-norm
 
 final = out_states[-1]
 np.savetxt('/tmp/q35-ref-state.txt', final, fmt='%.6e')
