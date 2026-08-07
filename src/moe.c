@@ -579,6 +579,11 @@ typedef struct {
 
 static void *exp_run(void *arg) {
     ExpJob *j = (ExpJob *)arg;
+    /* Mark this thread as inside the expert path: matvecs called here
+     * must NOT row-split (the 8 expert threads already saturate the
+     * P-cores; spawning more would oversubscribe). The main thread's
+     * attention/head matvecs split instead. */
+    ds4f_kernels_set_in_expert(1);
     /* cur/tmp/chain come from the caller's preallocated buffers (never
      * malloc per fetch). zero-init: the chain tail (clen < Lat) is stale
      * after the last matvec; zero-init makes the combine deterministic
@@ -806,6 +811,7 @@ static void *exp_run(void *arg) {
     if (ncopy < j->Lat)
         memset(j->out + ncopy, 0,
                (size_t)(j->Lat - ncopy) * sizeof(float));
+    ds4f_kernels_set_in_expert(0);
     return NULL;
 }
 

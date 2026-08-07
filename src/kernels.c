@@ -8,10 +8,15 @@
 #include <string.h>
 
 static int g_simd = 1;
+static __thread int g_in_expert = 0;
 
 void ds4f_kernels_set_simd(int on) { g_simd = on ? 1 : 0; }
 
 int ds4f_kernels_simd(void) { return g_simd && ds4f_simd_available(); }
+
+void ds4f_kernels_set_in_expert(int in_expert) { g_in_expert = in_expert ? 1 : 0; }
+
+int ds4f_kernels_in_expert(void) { return g_in_expert; }
 
 float ds4f_e8m0_value(uint8_t b) {
     return ldexpf(1.0f, (int)b - 127);   /* b = 0 -> 2^-127 */
@@ -151,7 +156,13 @@ void ds4f_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
      * 248320-row head) row-partition across worker threads. */
     if (ds4f_kernels_simd() && (C % 8) == 0 && (C % DS4F_MLX4_GROUP) == 0) {
         int nth = 1;
-        if (R >= 8192) {        /* only the lm_head (248320 rows) */
+        /* Row-split only off the expert path. The 8 expert worker
+         * threads already saturate the P-cores (8 on this Mac), so a
+         * matvec they call must NOT spawn more threads -- it would
+         * oversubscribe and thrash. The main thread (attention/head)
+         * has idle cores, so its matvecs split down to R=2048 (the z,
+         * o, q/k/v projections in linear/gqa). */
+        if (!ds4f_kernels_in_expert() && R >= 2048) {
             nth = 8;
             const char *env = getenv("DS4F_ATTN_THREADS");
             if (env) {
@@ -159,7 +170,7 @@ void ds4f_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
                 if (v >= 1 && v <= 32) nth = v;
             }
         }
-        if (nth > 1 && nth <= 16 && R >= 8192) {
+        if (nth > 1 && nth <= 16 && R >= 2048 && !ds4f_kernels_in_expert()) {
             /* stack-local jobs: this function is called concurrently
              * by the 8 expert worker threads, so NO static scratch */
             pthread_t th[16];

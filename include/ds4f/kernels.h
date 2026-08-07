@@ -1,0 +1,128 @@
+/*
+ * kernels.h -- scalar mxfp4 math (issue #2, milestone step 2).
+ *
+ * The mxfp4 pool format written by tools/convert-ds4f.py:
+ *   values:  2 elements per byte, even index in LOW nibble
+ *   scales:  one E8M0 byte per block (16 or 32 elements),
+ *            value = 2^(b - 127); b = 0 encodes 2^-127
+ *   element = +/-{0, 0.5, 1, 1.5, 2, 3, 4, 6} * scale  (MX E2M1)
+ *
+ * These are the scalar-correct reference kernels: portable C99, no
+ * SIMD. The SIMD paths (AVX2/NEON) must verify bit-identical against
+ * these on fixtures before they are allowed to replace them.
+ */
+#ifndef DS4F_KERNELS_H
+#define DS4F_KERNELS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#define DS4F_MXFP4_BLOCK16 16
+#define DS4F_MXFP4_BLOCK32 32
+
+/* E8M0 block scale value: 2^(b-127); b=0 -> 2^-127. */
+float ds4f_e8m0_value(uint8_t b);
+
+/* Decode n flat mxfp4 elements (even index = low nibble, one E8M0
+ * scale per bsize elements) into fp32. */
+void ds4f_mxfp4_decode(const uint8_t *vals, const uint8_t *scales,
+                       int n, int bsize, float *out);
+
+/* y[r] = sum_c W[r,c] * x[c]; W is row-major mxfp4 [R x C].
+ * scratch must hold R*C floats. */
+void ds4f_mxfp4_matvec(const uint8_t *vals, const uint8_t *scales,
+                       int R, int C, int bsize, const float *x, float *y,
+                       float *scratch);
+
+/* Router: scores[e] = sum_c W[e,c] * x[c] + bias[e]; W is resident
+ * fp32 [E x H], bias optional. */
+void ds4f_router_scores(const float *W, const float *bias, int E, int H,
+                        const float *x, float *scores);
+
+/* Plain fp32 matvec: y[r] = sum_c W[r,c] * x[c], row-major [R x C]. */
+void ds4f_f32_matvec(const float *W, int R, int C, const float *x,
+                     float *y);
+
+/* BF16 matvec: W is brain-float16 (truncated fp32), decoded on the fly.
+ * scores[r] = sum_c W[r,c] * x[c] (+ bias[r] when given). */
+void ds4f_bf16_matvec(const uint16_t *W, int R, int C, const float *x,
+                      const float *bias, float *y);
+
+/* F8_E4M3 matvec (issue #6): W is F8 bytes [R x C], E8M0 block scales
+ * [SR x SC]; element (r,c) uses scale[r*SR/R][c*SC/C] (the checkpoint's
+ * per-group scheme). y[r] = sum_c W[r,c] * x[c]. Scalar reference;
+ * SIMD path lands with the attention step. */
+void ds4f_f8_matvec(const uint8_t *W, const uint8_t *scales,
+                    int R, int C, int SR, int SC,
+                    const float *x, float *y);
+
+/* SIMD dispatch (issue #5): when enabled AND available, mxfp4 decode /
+ * matvec / bf16 matvec route to the NEON or AVX2 path. Decode stays
+ * bit-identical; matvec accumulates in lane order (tolerance-verified).
+ * Default: enabled. */
+void ds4f_kernels_set_simd(int on);
+int  ds4f_kernels_simd(void);
+/* Thread-context flag for the row-split dispatch: the 8 expert worker
+ * threads already saturate the P-cores, so matvecs they call must NOT
+ * spawn more threads; the main thread (attention/head path) has idle
+ * cores and SHOULD split. exp_run sets the flag around its body. */
+void ds4f_kernels_set_in_expert(int in_expert);
+int  ds4f_kernels_in_expert(void);
+
+/* I8 matvec: W is int8 bytes with optional E8M0 block scales [SR x SC]
+ * (NULL scales = 1.0). Used by I8-quantized checkpoints (the V4-Flash
+ * checkpoint's experts are I8, and the head often is too). */
+void ds4f_i8_matvec(const uint8_t *W, const uint8_t *scales,
+                    int R, int C, int SR, int SC, const float *x,
+                    float *y);
+
+/* row-range variant for threaded callers: computes rows [r0, r1)
+ * with the GLOBAL row scale mapping (sr = (r*SR)/R for the absolute
+ * row r). Scalar only (the SIMD path handles the whole matrix). */
+void ds4f_f8_matvec_rows(const uint8_t *W, const uint8_t *scales,
+                         int R, int C, int SR, int SC, const float *x,
+                         float *y, int r0, int r1);
+
+/* F16 (IEEE half) matvec + scalar conversion. */
+float ds4f_f16_to_f32(uint16_t h);
+void ds4f_f16_matvec(const uint16_t *W, int R, int C, const float *x,
+                     float *y);
+
+/* single F8_E4M3 byte to float (the scalar LUT; used by the hc_*
+ * hyper-connection scales). */
+float ds4f_f8_value(uint8_t b);
+
+/* F8 decode of one row of a [V x H] F8_E4M3 tensor with E8M0 block
+ * scales [SR x SC] (element (r,c) uses scale[r*SR/V][c*SC/H]); NULL
+ * scales means 1.0 everywhere. Used by the embedding gather. */
+void ds4f_f8_decode_row(const uint8_t *W, const uint8_t *scales,
+                        int V, int H, int SR, int SC, int row, float *out);
+
+/* ------------------------------------------------------------------ */
+/* MLX 4-bit (Qwen3.5-35B-A3B MLX quant) kernel                       */
+/* ------------------------------------------------------------------ */
+/*
+ * The MLX 4-bit pool format (split-mlx-switchmlp.py output):
+ *   values:  one U32 per 8 elements, low nibble first:
+ *            elem(k) = (u32 >> (4*(k%8))) & 0xF, k in [0, R*C)
+ *   scales:  one BF16 per group of G=64 elements, row-major:
+ *            scale[g] with g = (r*C + c) / G
+ *   biases:  one BF16 per group (same layout as scales)
+ *   element(r,c) = (q - 8) * scale[g] + bias[g]
+ *
+ * The MLX convention is symmetric 4-bit (q in [0,15] -> -8..7),
+ * unlike mxfp4's E2M1. Scalar reference; SIMD later must verify
+ * bit-identical on fixtures.
+ */
+#define DS4F_MLX4_GROUP 64
+
+/* Decode n elements (flattened row-major [R x C]) into fp32. */
+void ds4f_mlx4_decode(const uint32_t *vals, const uint16_t *scales,
+                      const uint16_t *biases, int n, float *out);
+
+/* y[r] = sum_c W[r,c] * x[c]; W is MLX 4-bit packed. */
+void ds4f_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
+                      const uint16_t *biases, int R, int C,
+                      const float *x, float *y);
+
+#endif /* DS4F_KERNELS_H */
