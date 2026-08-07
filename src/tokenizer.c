@@ -229,6 +229,53 @@ int ds4f_tokenizer_load(Ds4fTokenizer *t, const char *path) {
         pair_put(t, li, ri, i, mi);
     }
 
+    /* added_tokens: special tokens like <|im_start|>. HF matches these
+     * VERBATIM (longest-first) before BPE -- the engine must too, or
+     * chat-format prompts get BPE-split into garbage (e.g. the chars of
+     * "<|im_start|>" instead of its single id). */
+    const JEntry *added = json_get(doc->root, doc->nroot, "added_tokens");
+    t->nadded = 0;
+    if (added && added->type == 3) {
+        for (int i = 0; i < added->nchild && t->nadded < 64; i++) {
+            const JEntry *e = &added->child[i];
+            if (e->type != 2) continue;
+            const JEntry *ce = json_get(e->child, e->nchild, "content");
+            const JEntry *ie = json_get(e->child, e->nchild, "id");
+            if (!ce || ce->type != 1 || !ie || ie->type != 0) continue;
+            size_t cl = (size_t)(ce->str_end - ce->str);
+            int id = (int)ie->inum;
+            if (cl == 0 || id < 0) continue;
+            char *cp = (char *)malloc(cl + 1);
+            if (!cp) continue;
+            memcpy(cp, ce->str, cl);
+            cp[cl] = 0;
+            t->added[t->nadded] = cp;
+            t->added_id[t->nadded] = id;
+            t->added_len[t->nadded] = cl;
+            t->nadded++;
+        }
+        /* sort by decreasing content length (longest-first match) */
+        for (int i = 0; i < t->nadded; i++) {
+            for (int j = i + 1; j < t->nadded; j++) {
+                if (t->added_len[j] > t->added_len[i]) {
+                    char *tmpc = t->added[i]; t->added[i] = t->added[j];
+                    t->added[j] = tmpc;
+                    int tmpi = t->added_id[i]; t->added_id[i] = t->added_id[j];
+                    t->added_id[j] = tmpi;
+                    size_t tmpl = t->added_len[i];
+                    t->added_len[i] = t->added_len[j];
+                    t->added_len[j] = tmpl;
+                }
+            }
+        }
+        if (getenv("DS4F_DEBUG_TOK")) {
+            fprintf(stderr, "[tok] %d added tokens:\n", t->nadded);
+            for (int i = 0; i < t->nadded && i < 40; i++)
+                fprintf(stderr, "  %d len=%zu id=%d %.30s\n", i,
+                        t->added_len[i], t->added_id[i], t->added[i]);
+        }
+    }
+
     json_free(doc);
     free(buf);
     return 0;
@@ -247,6 +294,8 @@ void ds4f_tokenizer_free(Ds4fTokenizer *t) {
     free(t->pkeys);
     free(t->pranks);
     free(t->pmerged);
+    for (int i = 0; i < t->nadded; i++) free(t->added[i]);
+    t->nadded = 0;
     memset(t, 0, sizeof *t);
 }
 
@@ -276,13 +325,57 @@ int ds4f_tokenizer_encode(const Ds4fTokenizer *t, const char *utf8,
                           int *ids, int max_ids) {
     const unsigned char *p = (const unsigned char *)utf8;
     int n = 0, first = 1;
+
+    /* added-token helper: match at position p, longest first */
     while (*p && n < max_ids) {
+        int matched = -1;
+        size_t mlen = 0;
+        for (int a = 0; a < t->nadded; a++) {
+            size_t al = t->added_len[a];
+            if (al > mlen && memcmp(p, t->added[a], al) == 0) {
+                matched = a;
+                mlen = al;
+            }
+        }
+        if (getenv("DS4F_DEBUG_TOK") && *p == '<') {
+            fprintf(stderr, "[tokenc] at '<' nadded=%d matched=%d mlen=%zu "
+                    "ctx: %.12s\n", t->nadded, matched, mlen, (const char *)p);
+        }
+        if (matched >= 0) {
+            ids[n++] = t->added_id[matched];
+            p += mlen;
+            first = 0;
+            continue;
+        }
+        /* newline: HF emits the "\n" char directly into the byte-level
+         * stream (token "Ċ", id 198) -- it is NOT a space and must not
+         * become the "Ġ " prefix. */
+        if (*p == '\n') {
+            char cbuf[8];
+            int cl = utf8_put(t->fwd[0x0A], cbuf, 8);
+            int id = vocab_find(t, cbuf, (size_t)cl);
+            if (id < 0) return -1;
+            ids[n++] = id;
+            p++;
+            first = 0;
+            continue;
+        }
         size_t sp = 0;
-        while (p[sp] == ' ' || p[sp] == '\t' || p[sp] == '\n' ||
+        while (p[sp] == ' ' || p[sp] == '\t' ||
                p[sp] == '\r') sp++;
         size_t start = sp;
+        /* stop the word at any position where an added (special) token
+         * starts -- otherwise "is<|im_end|>" becomes ONE BPE word and the
+         * special token gets split into its literal chars. */
         while (p[start] && p[start] != ' ' && p[start] != '\t' &&
-               p[start] != '\n' && p[start] != '\r') start++;
+               p[start] != '\n' && p[start] != '\r') {
+            int at_added = 0;
+            for (int a = 0; a < t->nadded && !at_added; a++)
+                if (memcmp(p + start, t->added[a], t->added_len[a]) == 0)
+                    at_added = 1;
+            if (at_added) break;
+            start++;
+        }
         if (start == 0) break;              /* no word left */
         /* word = p[0..start): [spaces][non-space run] */
         int wids[1024], wi = 0;
