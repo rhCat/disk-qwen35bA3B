@@ -263,7 +263,8 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             const float *v2 = kv->kv +
                 ((size_t)L * kv->max_tokens + t2) * kvlat + krows +
                 (size_t)khh * kh;
-            float w = wgt[t2] / sum;
+            float w = wgt[t2];   /* already normalized at line 260 --
+                                    do NOT divide by sum again */
             for (int i = 0; i < kh; i++)
                 attn_out[(size_t)h * kh + i] += w * v2[i];
         }
@@ -342,6 +343,13 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 sqrt(o2 / H) / (sqrt(a2 / ocols) + 1e-30f));
         if (token == 1 && L == 7) {
             FILE *gf = fopen("/tmp/q35-eng-gqa7.bin", "wb");
+            if (gf) {
+                fwrite(attn_out, sizeof(float), (size_t)ocols, gf);
+                fclose(gf);
+            }
+        }
+        if (token == 7 && L == 3) {
+            FILE *gf = fopen("/tmp/q35-eng-gqa-L3-t7.bin", "wb");
             if (gf) {
                 fwrite(attn_out, sizeof(float), (size_t)ocols, gf);
                 fclose(gf);
@@ -516,6 +524,16 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             float sig = 1.0f / (1.0f + expf(-acc));
             qkv[ch] = acc * sig;             /* silu */
         }
+        if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 8) {
+            double q2 = 0, k2 = 0, v2 = 0;
+            for (int i = 0; i < 2048; i++) q2 += (double)qkv[i] * qkv[i];
+            for (int i = 2048; i < 4096; i++) k2 += (double)qkv[i] * qkv[i];
+            for (int i = 4096; i < 8192; i++) v2 += (double)qkv[i] * qkv[i];
+            fprintf(stderr, "[postconv] L0 t8 q-rms %.6g k-rms %.6g "
+                    "v-rms %.6g v[0..3] %.6g %.6g %.6g %.6g\n",
+                    sqrt(q2 / 2048), sqrt(k2 / 2048), sqrt(v2 / 4096),
+                    qkv[4096], qkv[4097], qkv[4098], qkv[4099]);
+        }
     }
     /* q/k normalization, EXACTLY the reference (qwen3_5.py):
      *   inv_scale = kd^-0.5
@@ -611,7 +629,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 acc += Sh[(size_t)i * vd + j] * qh[i];
             oh[j] = acc;
         }
-        if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 6 && h == 0) {
+        if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 8 && h == 0) {
             double sm = 0.0;
             for (int i = 0; i < kd * vd; i++)
                 if (Sh[i] == Sh[i]) sm += (double)Sh[i] * Sh[i];
@@ -626,6 +644,16 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                     "q-rms %.6g v-rms %.6g delta-rms %.6g state-rms %.6g\n",
                     L, decay, beta, sqrt(k2 / kd), sqrt(q2 / kd),
                     sqrt(v2 / vd), sqrt(d2 / vd), sqrt(sm / (kd * vd)));
+            FILE *vf = fopen("/tmp/q35-eng-L0-k.bin", "wb");
+            if (vf) { fwrite(kh, sizeof(float), (size_t)kd, vf); fclose(vf); }
+            vf = fopen("/tmp/q35-eng-L0-q.bin", "wb");
+            if (vf) { fwrite(qh, sizeof(float), (size_t)kd, vf); fclose(vf); }
+            vf = fopen("/tmp/q35-eng-L0-v.bin", "wb");
+            if (vf) { fwrite(vh, sizeof(float), (size_t)vd, vf); fclose(vf); }
+            vf = fopen("/tmp/q35-eng-L0-delta.bin", "wb");
+            if (vf) { fwrite(delta, sizeof(float), (size_t)vd, vf); fclose(vf); }
+            vf = fopen("/tmp/q35-eng-L0-S.bin", "wb");
+            if (vf) { fwrite(Sh, sizeof(float), (size_t)kd * vd, vf); fclose(vf); }
         }
     }
     /* RMSNormGated: norm.weight * out * silu(z) -- the learned norm is

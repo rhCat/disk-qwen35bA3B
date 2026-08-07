@@ -758,6 +758,40 @@ int main(int argc, char **argv) {
                     if (state[i] != state[i]) { bad = 1; break; }
                 if (bad)
                     fprintf(stderr, "[nan] t%d after L%d\n", t, L);
+                if (t == 8 && L % 4 == 0) {
+                    char pth[128];
+                    snprintf(pth, sizeof pth, "/tmp/q35-eng-L%d-t8.bin", L);
+                    FILE *sf = fopen(pth, "wb");
+                    if (sf) {
+                        fwrite(state, sizeof(float), (size_t)cfg.hidden, sf);
+                        fclose(sf);
+                    }
+                }
+                if (L == 0) {
+                    char pth[128];
+                    snprintf(pth, sizeof pth, "/tmp/q35-eng-L0-t%d.bin", t);
+                    FILE *sf = fopen(pth, "wb");
+                    if (sf) {
+                        fwrite(state, sizeof(float), (size_t)cfg.hidden, sf);
+                        fclose(sf);
+                    }
+                }
+                if (t == 7 && L % 4 == 0) {
+                    char pth[128];
+                    snprintf(pth, sizeof pth, "/tmp/q35-eng-L%d-t7.bin", L);
+                    FILE *sf = fopen(pth, "wb");
+                    if (sf) {
+                        fwrite(state, sizeof(float), (size_t)cfg.hidden, sf);
+                        fclose(sf);
+                    }
+                }
+                if (t == 7 && L == cfg.n_layers - 1) {
+                    FILE *sf = fopen("/tmp/q35-eng-L39-t7.bin", "wb");
+                    if (sf) {
+                        fwrite(state, sizeof(float), (size_t)cfg.hidden, sf);
+                        fclose(sf);
+                    }
+                }
                 if (L < 2 || L % 8 == 0 || L >= 27 || t < 2 ||
                     (t == 1 && L < 8)) {
                     double sm = 0.0;

@@ -160,8 +160,8 @@ HEADS = 16 # GQA q heads
 RDD = 64   # rotary dims (partial 0.25 * 256)
 
 # ---- prompt (8 prompt tokens + the engine's 1st GENERATED token.
-# The engine's t7 logits argmax = 48017 Jupiter; it feeds Jupiter at t8.)
-pids = [760, 7526, 11247, 303, 279, 12570, 1785, 369, 48017]
+# Post-fix greedy picks 279 "the" at t7 (the 15.72 > Jupiter 15.57).)
+pids = [760, 7526, 11247, 303, 279, 12570, 1785, 369, 279]
 T = len(pids)
 print('prompt tokens:', pids)
 
@@ -281,14 +281,26 @@ for t in range(T):
                 readout[hv] = S[hv].T @ qq[hk]
             lin_state[L] = S
             if t == 8 and L == 0 and not printed_l0_delta:
-                print('ref L0 t8: g[:3]=%s beta[:3]=%s k-rms %.4g '
-                      'q-rms %.4g v-rms %.4g state-rms %.4g' % (
-                          ['%.4g' % v for v in g[:3]],
-                          ['%.4g' % v for v in beta[:3]],
-                          float(np.sqrt((kk**2).mean())),
-                          float(np.sqrt((qq**2).mean())),
-                          float(np.sqrt((vv**2).mean())),
-                          float(np.sqrt((S**2).mean()))), flush=True)
+                h0 = 0
+                # recompute h0 delta explicitly (loop leaves hv=31's delta)
+                kv0 = S[0].T @ kk[0]
+                d0 = (vv[0] - kv0) * beta[0]
+                print('ref L0 t8 h0: decay %.6g beta %.6g k-rms %.6g '
+                      'q-rms %.6g v-rms %.6g delta-rms %.6g state-rms %.6g' % (
+                          float(g[0]), float(beta[0]),
+                          float(np.sqrt((kk[0]**2).mean())),
+                          float(np.sqrt((qq[0]**2).mean())),
+                          float(np.sqrt((vv[0]**2).mean())),
+                          float(np.sqrt((d0**2).mean())),
+                          float(np.sqrt((S[0]**2).mean()))), flush=True)
+                # dump the full h0 vectors for cosine comparison
+                (kk[0]).astype(np.float32).tofile('/tmp/q35-ref-L0-k.bin')
+                (qq[0]).astype(np.float32).tofile('/tmp/q35-ref-L0-q.bin')
+                (vv[0]).astype(np.float32).tofile('/tmp/q35-ref-L0-v.bin')
+                d0.astype(np.float32).tofile('/tmp/q35-ref-L0-delta.bin')
+                (S[0]).astype(np.float32).tofile('/tmp/q35-ref-L0-S.bin')
+                if L == 0:
+                    print('ref dumped L0 t8 h0 vectors', flush=True)
                 printed_l0_delta = True
             # RMSNormGated: rmsnorm PER-HEAD with learned weight * silu(z)
             nwgt = ten_float(layer, '.linear_attn.norm.weight')
@@ -338,6 +350,8 @@ for t in range(T):
             gated = outs * (1.0 / (1.0 + np.exp(-gate)))
             if t == 1 and L == 7:
                 gated.astype(np.float32).tofile('/tmp/q35-ref-gqa7.bin')
+            if t == 7 and L == 3:
+                gated.astype(np.float32).tofile('/tmp/q35-ref-gqa-L3-t7.bin')
             r = proj(layer, '.self_attn.o_proj', gated.reshape(-1), H)
             if t == 0 and L == 3:
                 print('L3 t0: q rms %.4g k rms %.4g v rms %.4g s max %.4g '
