@@ -109,13 +109,20 @@ static int load_pins(Ds4fTrunk *tr) {
 }
 
 /* Reader: keeps at most nring-1 layers in flight ahead of the consumer,
- * so the slot it writes next is always one the consumer has finished. */
+ * so the slot it writes next is always one the consumer has finished.
+ * The stream runs over [npin, n_layers) per pass; multi-token
+ * generation calls ds4f_trunk_rewind() between tokens, which resets
+ * next_req/ready/consumed so the next pass re-streams every layer
+ * (the ring slots are reused, but the ready/consumed handshake makes
+ * the consumer wait for each layer's re-fetch). */
 static void *trunk_reader(void *p) {
     Ds4fTrunk *t = (Ds4fTrunk *)p;
     const int window = t->nring - 1;
     pthread_mutex_lock(&t->mu);
-    while (!t->stop && t->next_req < t->n_layers) {
-        while (!t->stop && t->next_req >= t->consumed + window)
+    while (!t->stop) {
+        while (!t->stop &&
+               (t->next_req >= t->n_layers ||
+                t->next_req >= t->consumed + window))
             pthread_cond_wait(&t->cv, &t->mu);
         if (t->stop) break;
         int L = t->next_req++;
@@ -141,6 +148,19 @@ static void *trunk_reader(void *p) {
     }
     pthread_mutex_unlock(&t->mu);
     return NULL;
+}
+
+/* Restart the streaming pass: the next bind() re-reads layers from
+ * npin upward (for multi-token generation, the trunk is re-streamed
+ * once per token). Call BEFORE the first bind of a new pass. */
+void ds4f_trunk_rewind(Ds4fTrunk *tr) {
+    if (!tr) return;
+    pthread_mutex_lock(&tr->mu);
+    tr->next_req = tr->npin;
+    tr->ready = tr->npin;
+    tr->consumed = tr->npin;
+    pthread_cond_broadcast(&tr->cv);
+    pthread_mutex_unlock(&tr->mu);
 }
 
 int ds4f_trunk_start(Ds4fTrunk *tr, int npin, int64_t slot, int nring) {

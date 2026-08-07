@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-import json, sys
-from collections import Counter
+import json
 m = json.load(open('/tmp/q35-pool/manifest.json'))
-print('keys:', list(m.keys()))
-print('n_layers', m['n_layers'], 'n_experts', m['n_experts'],
-      'expert_nbytes', m['expert_nbytes'])
-ts = m['tensors']
-print('tensor entries:', len(ts))
-t0 = ts[0]
-print('first:', {k: t0[k] for k in
-      ('layer', 'expert', 'fmt', 'shape', 'name', 'v_off', 'v_nbytes',
-       's_off', 's_nbytes', 'b_off', 'b_nbytes')})
-c = Counter((t['layer'], t['expert']) for t in ts)
-print('distinct (L,E):', len(c), 'per-expert tensors:', set(c.values()))
+t = m['tensors']
+x = t[0]
+print('gate keys:', list(x.keys()))
+print('s_off:', x.get('s_off'), 's_nbytes:', x.get('s_nbytes'))
+print('v_nbytes:', x.get('v_nbytes'), 'b_nbytes:', x.get('b_nbytes'))
+print('expert_nbytes:', m.get('expert_nbytes'))
+# slot 0: 24 + 0 = 24. v_off=24 -> rel_v=0. s_off?

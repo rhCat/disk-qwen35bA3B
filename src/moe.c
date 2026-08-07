@@ -210,6 +210,7 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
         tl->q3_opa[L] = tl->q3_opas[L] = tl->q3_opab[L] = -1;
         tl->q3_lnorm[L] = -1;
     }
+    tl->final_norm = -1;
     tl->hc_head_fn = tl->hc_head_base = tl->hc_head_scale = -1;
     tl->kvlat = 0;
 
@@ -321,9 +322,12 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
                     if (tl->attn_qn[L] < 0) tl->attn_qn[L] = k - 1;
                 } else if (name_ends(tt->name, ".attn.kv_norm.weight")) {
                     if (tl->attn_kvn[L] < 0) tl->attn_kvn[L] = k - 1;
-                } else if (name_ends(tt->name, ".attn_norm.weight")) {
+                } else if (name_ends(tt->name, ".attn_norm.weight") ||
+                           name_ends(tt->name, ".input_layernorm.weight")) {
                     if (tl->attn_norm[L] < 0) tl->attn_norm[L] = k - 1;
-                } else if (name_ends(tt->name, ".ffn_norm.weight")) {
+                } else if (name_ends(tt->name, ".ffn_norm.weight") ||
+                           name_ends(tt->name,
+                                     ".post_attention_layernorm.weight")) {
                     if (tl->ffn_norm[L] < 0) tl->ffn_norm[L] = k - 1;
                 } else if (name_ends(tt->name, ".attn.wq_a.weight")) {
                     if (tl->attn_wqa[L] < 0) tl->attn_wqa[L] = k - 1;
@@ -438,6 +442,9 @@ int ds4f_trunk_layout_load(Ds4fTrunkLayout *tl, const char *path) {
                     if (tl->q3_opab[L] < 0) tl->q3_opab[L] = k - 1;
                 } else if (name_ends(tt->name, ".linear_attn.norm.weight")) {
                     if (tl->q3_lnorm[L] < 0) tl->q3_lnorm[L] = k - 1;
+                } else if (name_ends(tt->name, ".model.norm.weight")) {
+                    /* final norm before lm_head (synthetic layer) */
+                    if (tl->final_norm < 0) tl->final_norm = k - 1;
                 }
             }
         }
@@ -491,6 +498,22 @@ void ds4f_topk(const float *scores, int E, int k, int *idx, float *w) {
             w[j + 1] = s;
         }
     }
+    /* Qwen3.5 SwitchMLP routing: softmax over ALL expert scores, then
+     * renormalize the selected top-k weights to sum 1 (the reference
+     * does routing_weights = softmax(gate_logits); topk; /= sum).
+     * The selected w[] currently holds the raw top-k logits. */
+    double mx = -1e30, sw = 0.0;
+    for (int e = 0; e < E; e++)
+        if ((double)scores[e] > mx) mx = (double)scores[e];
+    for (int e = 0; e < E; e++)
+        sw += exp((double)scores[e] - mx);
+    double ss = 0.0;
+    for (int j = 0; j < k && idx[j] >= 0; j++) {
+        w[j] = (float)(exp((double)w[j] - mx) / sw);
+        ss += (double)w[j];
+    }
+    if (ss > 0.0)
+        for (int j = 0; j < k && idx[j] >= 0; j++) w[j] = (float)(w[j] / ss);
 }
 
 /* Parallel expert chain job (issue #5): one per topk expert, run on its
@@ -566,6 +589,20 @@ static void *exp_run(void *arg) {
                 float s = gx[i];
                 float sig = 1.0f / (1.0f + expf(-s));
                 chain[i] = s * sig * ux[i];
+            }
+            if (getenv("DS4F_NAN_PROBE") && j->latent &&
+                j->latent[0] != j->latent[0]) { /* NaN latent? */
+            }
+            if (getenv("DS4F_DEBUG_CHAIN")) {
+                double g2 = 0.0, u2 = 0.0, c2 = 0.0;
+                for (long i = 0; i < M; i++) {
+                    g2 += (double)gx[i] * gx[i];
+                    u2 += (double)ux[i] * ux[i];
+                    c2 += (double)chain[i] * chain[i];
+                }
+                fprintf(stderr, "[chain] gate-rms %.6g up-rms %.6g "
+                        "chain-rms %.6g\n", sqrt(g2 / M), sqrt(u2 / M),
+                        sqrt(c2 / M));
             }
             /* down(chain) -> cur (Lat floats) */
             if (d->fmt == 1) {
@@ -815,6 +852,17 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             rmsnorm_moe((const uint16_t *)(const void *)(
                             tr + tl->t[tl->ffn_norm[L]].off),
                         H, xin);
+    } else {
+        /* Qwen3.5 (no mHC): x = x + mlp(post_attention_layernorm(x)).
+         * The experts project the NORMED input; the residual adds to
+         * the raw state. */
+        xin = (float *)malloc((size_t)H * sizeof(float));
+        if (!xin) return -1;
+        memcpy(xin, state, (size_t)H * sizeof(float));
+        if (tl->ffn_norm[L] >= 0 && !getenv("DS4F_NO_NORMS"))
+            rmsnorm_moe((const uint16_t *)(const void *)(
+                            tr + tl->t[tl->ffn_norm[L]].off),
+                        H, xin);
     }
 
     /* Entry RMS: the F-rescale target (hc) or the RMS-rescale fallback
@@ -847,15 +895,13 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         long R = tl->t[di].dims[0], C = tl->t[di].dims[1];
         if (C == H && R <= D) {
             ds4f_f32_matvec((const float *)(const void *)(tr + tl->t[di].off),
-                            (int)R, (int)C,
-                            hc_ok ? xin : state, latent);
+                            (int)R, (int)C, xin, latent);
             (*n_matvec)++;
             did_ok = 1;
         }
     }
     if (!did_ok) {
-        const float *xinp = hc_ok ? xin : state;
-        for (int i = 0; i < Lat && i < H; i++) latent[i] = xinp[i];
+        for (int i = 0; i < Lat && i < H; i++) latent[i] = xin[i];
         for (int i = H; i < Lat; i++) latent[i] = 0.0f;
     }
 
@@ -912,12 +958,30 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         for (int j = 0; j < cfg->topk; j++) {
             if (!es[j]) continue;
             ExpJob *jb = &job[sj++];
+            if (getenv("DS4F_DEBUG_CHAIN") && L < 3) {
+                double o2 = 0.0;
+                for (int i = 0; i < Lat; i++)
+                    o2 += (double)jb->out[i] * jb->out[i];
+                fprintf(stderr, "[wsel] L%d j%d w=%.6g out-rms %.6g\n",
+                        L, j, (double)wsel[j], sqrt(o2 / Lat));
+            }
             for (int i = 0; i < Lat; i++)
                 acc[i] += wsel[j] * jb->out[i];
         }
     }
     for (int j = 0; j < njob; j++)
         free(job[j].out);            /* scratch is borrowed */
+
+    if (getenv("DS4F_NAN_PROBE") && L < 3) {
+        double a2 = 0.0, i2 = 0.0;
+        for (int i = 0; i < H; i++) {
+            a2 += (double)acc[i] * acc[i];
+            i2 += (double)xin[i] * xin[i];
+        }
+        fprintf(stderr, "[moeacc] L%d xin-rms %.6g acc-rms %.6g "
+                "gain %.6g\n", L, sqrt(i2 / H), sqrt(a2 / H),
+                sqrt(a2 / H) / (sqrt(i2 / H) + 1e-30f));
+    }
 
     /* state = state + W_up * acc (mHC: streams = B*orig + C*F) */
     int up_ok = 0;
@@ -931,6 +995,16 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
              * zero it so the update is deterministic (the tail must
              * not be malloc garbage) */
             if (R < H) memset(out + R, 0, (size_t)(H - R) * sizeof(float));
+            if (getenv("DS4F_NAN_PROBE") && L < 3) {
+                double o2 = 0.0, i2 = 0.0;
+                for (int i = 0; i < H; i++) {
+                    o2 += (double)out[i] * out[i];
+                    i2 += (double)xin[i] * xin[i];
+                }
+                fprintf(stderr, "[moeout] L%d xin-rms %.6g out-rms %.6g "
+                        "gain %.6g\n", L, sqrt(i2 / H), sqrt(o2 / H),
+                        sqrt(o2 / H) / (sqrt(i2 / H) + 1e-30f));
+            }
             if (hc_ok) {
                 /* F-rescale: the approximate expert reads amplify (the
                  * real model bounds F by training). Rescale the up
@@ -1020,9 +1094,12 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
 
     /* Activation bounding. With mHC tensors the stream update above
      * already is the bounded residual (B doubly stochastic, C <= 2).
-     * Without them, fall back to the RMS-rescale (deterministic IEEE
-     * sqrtf/div, both backends must match it exactly). */
-    if (!hc_ok) {
+     * Without them, the Qwen3.5 path applies the post_attention norm
+     * (stable by construction -- the reference needs no rescale). The
+     * RMS-rescale was a DS-V4 mHC-era fallback; keep it only when the
+     * fixture explicitly asks (DS4F_RMS_RESCALE=1), otherwise the
+     * residual is exact. */
+    if (!hc_ok && getenv("DS4F_RMS_RESCALE")) {
         double ss = 0.0;
         for (int i = 0; i < H; i++) {
             float v = state[i];
@@ -1030,6 +1107,11 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         }
         float rms_out = sqrtf((float)(ss / (double)H)) + 1e-30f;
         float gain = rms_in / rms_out;
+        if (getenv("DS4F_NAN_PROBE") && (L < 5 || L == 6 || L == 8 ||
+                                         L == 12 || L == 16 || L == 20 ||
+                                         L == 24 || L == 27))
+            fprintf(stderr, "[moe] L%d hc_ok=%d rms_in %.6g rms_out %.6g "
+                    "gain %.6g\n", L, hc_ok, rms_in, rms_out, gain);
         if (gain > 0.0f && gain < 1e30f)
             for (int i = 0; i < H; i++) state[i] *= gain;
     }

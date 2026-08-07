@@ -145,7 +145,10 @@ int main(int argc, char **argv) {
 
     Ds4fTrunk trunk;
     if (ds4f_trunk_open(&trunk, trunk_path, off_path) != 0) return 2;
-    if (trunk.n_layers != cfg.n_layers) {
+    if (trunk.n_layers != cfg.n_layers &&
+        trunk.n_layers != cfg.n_layers + 1) {
+        /* +1 tolerated: the Qwen3.5 builder rides the final norm in a
+         * synthetic last trunk layer (before lm_head) */
         fprintf(stderr, "trunk has %d layers, config says %d\n",
                 trunk.n_layers, cfg.n_layers);
         return 1;
@@ -467,11 +470,31 @@ int main(int argc, char **argv) {
             for (int j = 1; j < mhc_streams; j++)
                 memcpy(state + (size_t)j * cfg.hidden, state,
                        (size_t)cfg.hidden * sizeof(float));
+        } else if (text_mode && t == 0) {
+            ds4f_embed_gather(&embed, pids[0], state);
+            if (getenv("DS4F_NAN_PROBE")) {
+                double em = 0.0;
+                for (int i = 0; i < cfg.hidden; i++)
+                    em += (double)state[i] * state[i];
+                fprintf(stderr, "[emb] rms %.6g\n", sqrt(em / cfg.hidden));
+            }
+        }
+        if (moe_mode) {
+            /* multi-token generation re-streams the trunk once per
+             * token: restart the reader's pass before the first bind */
+            ds4f_trunk_rewind(&trunk);
         }
         for (int L = 0; L < cfg.n_layers; L++) {
             if (getenv("DS4F_TIME_LAYERS") && t == 0 &&
                 (L % 4 == 0 || L == cfg.n_layers - 1))
                 fprintf(stderr, "[L] t0 L%d at %.3fs\n", L, now_s() - t0);
+            if (getenv("DS4F_NAN_PROBE")) {
+                int bad = 0;
+                for (int i = 0; i < cfg.hidden; i++)
+                    if (state[i] != state[i]) { bad = 1; break; }
+                if (bad)
+                    fprintf(stderr, "[nan] t%d before L%d\n", t, L);
+            }
             if (moe_mode && t == 0 && L < 3)
                 fprintf(stderr, "moe: token 0 layer %d\n", L);
             const uint8_t *tr = ds4f_trunk_bind(&trunk, L);
@@ -669,6 +692,20 @@ int main(int argc, char **argv) {
             if (trf && use_real)
                 for (int j = 0; j < cfg.topk; j++)
                     fprintf(trf, "%d,%d\n", L, idx[j]);
+            if (getenv("DS4F_NAN_PROBE")) {
+                int bad = 0;
+                for (int i = 0; i < cfg.hidden; i++)
+                    if (state[i] != state[i]) { bad = 1; break; }
+                if (bad)
+                    fprintf(stderr, "[nan] t%d after L%d\n", t, L);
+                if (L < 2 || L % 8 == 0 || L >= 27 || t < 2) {
+                    double sm = 0.0;
+                    for (int i = 0; i < cfg.hidden; i++)
+                        sm += (double)state[i] * state[i];
+                    fprintf(stderr, "[st] t%d after L%d rms %.6g\n",
+                            t, L, sqrt(sm / cfg.hidden));
+                }
+            }
         }
         if (text_mode) {
             /* the head reads the mHC-contracted stream when the
@@ -720,6 +757,52 @@ int main(int argc, char **argv) {
                             t, sqrtf((float)(d2 / (double)cfg.hidden)));
                     memcpy(prev_hin, hstate_in,
                            (size_t)cfg.hidden * sizeof(float));
+                }
+            }
+            if (tl.final_norm >= 0) {
+                /* Qwen3.5 final norm before lm_head (BF16 [hidden]);
+                 * the tensor lives in the synthetic last trunk layer.
+                 * Norm into xin_buf (free after the layer loop). */
+                double ss0 = 0.0;
+                int bad0 = 0;
+                for (int i = 0; i < cfg.hidden; i++) {
+                    ss0 += (double)hstate_in[i] * (double)hstate_in[i];
+                    if (hstate_in[i] != hstate_in[i]) bad0 = 1;
+                }
+                if (getenv("DS4F_NAN_PROBE"))
+                    fprintf(stderr, "[fin] t%d pre-norm rms %.6g bad %d\n",
+                            t, sqrt(ss0 / cfg.hidden), bad0);
+                const uint8_t *trf = ds4f_trunk_bind(
+                    &trunk, tl.n_layers - 1);
+                if (trf && getenv("DS4F_NAN_PROBE")) {
+                    const Ds4fTrunkTensor *fn = &tl.t[tl.final_norm];
+                    const uint16_t *fnw = (const uint16_t *)(const void *)
+                                          (trf + fn->off);
+                    float w0, w1;
+                    uint32_t b0 = (uint32_t)fnw[0] << 16;
+                    uint32_t b1 = (uint32_t)fnw[1] << 16;
+                    memcpy(&w0, &b0, 4);
+                    memcpy(&w1, &b1, 4);
+                    fprintf(stderr, "[fin] final_norm idx %d off %ld "
+                            "nbytes %ld w[0]=%.4f w[1]=%.4f\n",
+                            tl.final_norm, (long)fn->off, (long)fn->nbytes,
+                            w0, w1);
+                }
+                if (trf) {
+                    const Ds4fTrunkTensor *fn = &tl.t[tl.final_norm];
+                    const uint16_t *fnw = (const uint16_t *)(const void *)
+                                          (trf + fn->off);
+                    double ss = 0.0;
+                    for (int i = 0; i < cfg.hidden; i++)
+                        ss += (double)hstate_in[i] * hstate_in[i];
+                    float r = sqrtf((float)(ss / (double)cfg.hidden) + 1e-6f);
+                    for (int i = 0; i < cfg.hidden; i++) {
+                        uint32_t bits = (uint32_t)fnw[i] << 16;
+                        float w;
+                        memcpy(&w, &bits, 4);
+                        xin_buf[i] = hstate_in[i] / r * w;
+                    }
+                    hstate_in = xin_buf;
                 }
             }
             if (ds4f_head_logits(&head, hstate_in, logits) != 0) {

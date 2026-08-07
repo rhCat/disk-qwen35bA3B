@@ -112,6 +112,34 @@ exit 0 (23 GB gate armed, never fired)
   SIGBUS'd in the 8-thread expert path), Makefile -O2 on Darwin (the
   full gate incl. e2e_text determinism passes at -O2). Real-model run:
   **0.21 s/token, PEAK RSS 2.28 GB, exit 0**
+- **ACCURACY (2026-08-06): the forward is now numerically CORRECT --
+  real logits, stable states, no NaN.** Three root-cause bugs fixed:
+  1. **Router weights were raw logits (~55) not softmax probabilities**
+     -- ds4f_topk stored scores directly; the reference does
+     softmax(gate_logits) -> topk -> renormalize to sum 1. This was
+     the 53x->8909x-per-layer MoE amplifier that exploded the state
+     (0.04 -> 4.5e20 -> NaN by L28).
+  2. **input_layernorm / post_attention_layernorm were never applied**
+     -- the reference is x = x + attn(input_norm(x)); x = x +
+     mlp(post_norm(x)). Both attention steps now project the NORMED
+     input and residual-add to the raw state; the MoE norms xin.
+  3. **RMSNormGated normalization is per-128-head**, not global 4096.
+  Result: hidden state stable at 7-10 rms through all 40 layers,
+  t0 logits are real vocabulary tokens, generated output went from
+  "!!!!" to "Rot" (a real word fragment). State rms 5-8 across all 4
+  generated tokens, exit 0.
+- **TRUNK RE-STREAM (2026-08-06): multi-token generation.** The trunk
+  ring was single-pass: the reader streamed layers forward and
+  overwrote ring slots (L % nring) while token 1 re-read them --
+  fixed tensors read as garbage at t1 (dt_bias = 1e-23). Added
+  ds4f_trunk_rewind(): the engine re-streams the trunk once per token
+  (reader waits at end-of-pass until rewound; ready/consumed
+  handshake makes each bind wait for the re-fetch). Keeps the ring
+  budget (2 x 19 MB); trunk re-read is 631 MB/token, the measured
+  streaming rate. Gate 20/20 incl. the e2e fixtures (no deadlock).
+- remaining: text is short fragments, not yet coherent prose -- the
+  known approximations (text-only mrope positions, conv-ring boundary
+  semantics) are the next fidelity targets
 
 ## Graceful stop (the guard)
 

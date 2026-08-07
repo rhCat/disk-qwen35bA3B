@@ -108,16 +108,24 @@ def main():
 
     tbin = open(os.path.join(out, "trunk.bin"), "wb")
     toff = open(os.path.join(out, "trunk.offsets"), "wb")
-    put_u64(toff, len(layer_ids))
+    # final norm (language_model.model.norm.weight) rides as a synthetic
+    # layer at index n_layers; the engine applies it before lm_head.
+    final_norm = "language_model.model.norm.weight"
+    synth_layers = list(layer_ids) + [max(layer_ids) + 1] \
+        if final_norm in wm else list(layer_ids)
+    put_u64(toff, len(synth_layers))
     buf = bytearray(1 << 20)
     at = 0
-    trunk_json = {"n_layers": len(layer_ids), "layers": []}
+    trunk_json = {"n_layers": len(synth_layers), "layers": []}
     align = 8
-    for L in layer_ids:
+    for L in synth_layers:
         put_u64(toff, at)
         lay_bytes = 0
         ltens = []
-        for name in sorted(layers[L]):
+        names = list(layers[L]) if L in layers else []
+        if L == max(layer_ids) + 1 and final_norm in wm:
+            names = [final_norm]
+        for name in sorted(names):
             fn, off, nb, dt, shp = span(name)
             pad = (-lay_bytes) % align
             if pad:
