@@ -26,7 +26,7 @@ echo "=== real-scale run: trunk $TRUNK, pool $POOL, gen $GEN, limit ${LIMIT}GB =
   --layout-trunk "$TRUNK/trunk.json" \
   --layout-pool "$POOL/manifest.json" \
   --head "$TRUNK/head.json" --embed "$TRUNK/embed.json" \
-  --tokenizer "$TOK" --text "Hello" \
+  --tokenizer "$TOK" --text "${PROMPT:-The capital of France is}" \
   --gen "$GEN" --cache-gb 2 --pin-layers 4 \
   --mem-limit-gb "$LIMIT" \
   > /tmp/q35-run.log 2>&1
