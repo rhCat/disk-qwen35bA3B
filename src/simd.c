@@ -148,8 +148,20 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
     if (r1 > R) r1 = R;
     float srow[64], brow[64];
     float32x4_t acc[8];
-    float *row = (float *)malloc((size_t)C * sizeof(float));
-    if (!row) return;
+    /* Per-thread scratch row: this function is called concurrently by
+     * the 8 expert worker threads and the head's row-split threads, so
+     * the buffer MUST be thread-local (a static would race). Grow on
+     * demand and reuse across calls -- kills ~960 mallocs/token in the
+     * expert path (the hot loop). TLS is bounded: 16 threads x max C. */
+    static __thread float *tl_row = NULL;
+    static __thread size_t tl_row_cap = 0;
+    if ((size_t)C > tl_row_cap) {
+        float *nr = (float *)realloc(tl_row, (size_t)C * sizeof(float));
+        if (!nr) return;
+        tl_row = nr;
+        tl_row_cap = (size_t)C;
+    }
+    float *row = tl_row;
     for (int r = r0; r < r1; r++) {
         const uint32_t *vr = vals + (size_t)r * (C / 8);
         int ng = (C + DS4F_MLX4_GROUP_LOCAL - 1) / DS4F_MLX4_GROUP_LOCAL;
@@ -216,7 +228,6 @@ void ds4f_simd_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
         for (; c2 < C; c2++) s += row[c2] * x[c2];
         y[r] = s;
     }
-    free(row);
 }
 
 /* I8 matvec: 16 int8 -> 16 floats, per-16-group scale (SC % 16 == 0
