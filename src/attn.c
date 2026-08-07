@@ -41,6 +41,7 @@ void ds4f_kv_free(Ds4fKvCache *c) {
     if (!c) return;
     free(c->kv);
     free(c->lin);
+    free(c->conv);
     memset(c, 0, sizeof *c);
 }
 
@@ -54,6 +55,24 @@ int ds4f_kv_lin_init(Ds4fKvCache *c, int v_heads, int kd, int vd) {
     c->lin_kd = kd;
     c->lin_vd = vd;
     c->lin_alloc = 1;
+    return 0;
+}
+
+/* Allocate the linear-attn conv1d ring (Q3_CONV_K x qkv_rows per layer).
+ * Persistent across tokens -- the causal conv needs the past qkv. */
+int ds4f_kv_conv_init(Ds4fKvCache *c, int qkv_rows) {
+    if (!c || qkv_rows < 1) return -1;
+    if (c->conv_alloc && c->conv_rows == qkv_rows) return 0;
+    if (c->conv) {
+        free(c->conv);
+        c->conv = NULL;
+        c->conv_alloc = 0;
+    }
+    size_t n = (size_t)c->n_layers * 4 * qkv_rows;
+    c->conv = (float *)calloc(n, sizeof(float));
+    if (!c->conv) return -1;
+    c->conv_rows = qkv_rows;
+    c->conv_alloc = 1;
     return 0;
 }
 

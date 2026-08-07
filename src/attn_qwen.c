@@ -287,8 +287,36 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         }
         for (int i = 0; i < vrows; i++) g2 += (double)v[i] * v[i];
         fprintf(stderr, "[gqa] L3 q-rms %.6g attn-rms %.6g v-rms %.6g "
-                "gate[%.4g, %.4g]\n", sqrt(q2 / (heads * kh)),
-                sqrt(a2 / (heads * kh)), sqrt(g2 / vrows), gmin, gmax);
+                "gate[%.4g, %.4g] heads=%d kh=%d qh=%d qrows=%d\n",
+                sqrt(q2 / (heads * kh)), sqrt(a2 / (heads * kh)),
+                sqrt(g2 / vrows), gmin, gmax, heads, kh, qh, qrows);
+        if (qn >= 0) {
+            const uint16_t *qwnp = (const uint16_t *)(const void *)
+                (tr + tl->t[qn].off);
+            fprintf(stderr, "[gqa] L3 qn[0..3]=%.6g %.6g %.6g %.6g "
+                    "gate[0..3]=%.6g %.6g %.6g %.6g\n",
+                    bf16_f(qwnp[0]), bf16_f(qwnp[1]), bf16_f(qwnp[2]),
+                    bf16_f(qwnp[3]),
+                    gate[0], gate[1], gate[2], gate[3]);
+        }
+        if (getenv("DS4F_DUMP_Z")) {
+            FILE *qf = fopen("/tmp/q35-eng-gqaq.bin", "wb");
+            if (qf) {
+                fwrite(qq, sizeof(float), (size_t)heads * kh, qf);
+                fwrite(gate, sizeof(float), (size_t)heads * kh, qf);
+                fclose(qf);
+            }
+            FILE *xf = fopen("/tmp/q35-eng-gqaxin.bin", "wb");
+            if (xf) {
+                fwrite(xin, sizeof(float), (size_t)H, xf);
+                fclose(xf);
+            }
+            FILE *pf = fopen("/tmp/q35-eng-gqaproj.bin", "wb");
+            if (pf) {
+                fwrite(q, sizeof(float), (size_t)qrows, pf);
+                fclose(pf);
+            }
+        }
     }
     free(gate);
     free(qq);
@@ -390,10 +418,15 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     if (!kv || token < 0 || token >= kv->max_tokens) return 0;
     if (!kv->lin_alloc)
         if (ds4f_kv_lin_init(kv, v_heads, kd, vd) != 0) return -1;
+    if (!kv->conv_alloc)
+        if (ds4f_kv_conv_init(kv, qkv_rows) != 0) return -1;
+    /* the conv1d ring lives in the kv cache: it must survive across
+     * tokens (the causal conv reads the PREVIOUS qkv vectors) */
+    float *conv_ring = kv->conv + (size_t)L * 4 * qkv_rows;
 
     float *buf = (float *)calloc(
         (size_t)(H + qkv_rows + z_rows + o_rows + v_heads * vd +
-                 v_heads * kd + Q3_CONV_K * qkv_rows + 2 * H + 1),
+                 v_heads * kd + 2 * H + 1),
         sizeof(float));
     if (!buf) return -1;
     float *xin = buf;               /* input_layernorm(state) */
@@ -402,7 +435,6 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     float *o = z + z_rows;
     float *readout = o + o_rows;              /* v_heads*vd */
     float *qk = readout + v_heads * vd;       /* k_heads*kd (q) + k */
-    float *conv_ring = qk + 2 * k_heads * kd; /* Q3_CONV_K * qkv_rows */
 
     /* reference: x = x + GatedDeltaNet(input_layernorm(x)) */
     if (iln >= 0) {
@@ -637,7 +669,8 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         free(buf);
         return -1;
     }
-    if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 0) {
+    if (getenv("DS4F_NAN_PROBE") && L == 0 &&
+        (token == 0 || token == 1)) {
         double r2 = 0.0, z2 = 0.0, o2 = 0.0, q2 = 0.0;
         for (int i = 0; i < v_heads * vd; i++) {
             r2 += (double)readout[i] * readout[i];
@@ -646,7 +679,9 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         for (int i = 0; i < H; i++) o2 += (double)o[i] * o[i];
         for (int i = 0; i < k_heads * kd; i++) q2 += (double)qkv[i] * qkv[i];
         if (getenv("DS4F_DUMP_Z")) {
-            FILE *zf = fopen("/tmp/q35-eng-qkv.bin", "wb");
+            char qfn[128];
+            snprintf(qfn, sizeof qfn, "/tmp/q35-eng-qkv-t%d.bin", token);
+            FILE *zf = fopen(qfn, "wb");
             if (zf) {
                 fwrite(qkv, sizeof(float), (size_t)qkv_rows, zf);
                 fclose(zf);
@@ -656,6 +691,13 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 fwrite(a32, sizeof(float), 32, bf);
                 fwrite(b32, sizeof(float), 32, bf);
                 fclose(bf);
+            }
+            if (token == 1) {
+                FILE *sf = fopen("/tmp/q35-eng-state-t1.bin", "wb");
+                if (sf) {
+                    fwrite(state, sizeof(float), (size_t)H, sf);
+                    fclose(sf);
+                }
             }
         }
         /* per-head r of head 0 */

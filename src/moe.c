@@ -673,6 +673,9 @@ static void *exp_run(void *arg) {
                         (j->slot + g->rel_v);
                     const uint16_t *s0 = (const uint16_t *)(const void *)
                         (j->slot + g->rel_s);
+                    const uint16_t *b0 = g->rel_b >= 0
+                        ? (const uint16_t *)(const void *)(j->slot + g->rel_b)
+                        : NULL;
                     fprintf(stderr, "[expw] rel_v=%ld rel_s=%ld "
                             "dims=[%ld,%ld] Lat=%d "
                             "w0=%08x %08x %08x %08x s0=%04x %04x %04x %04x\n",
@@ -680,6 +683,21 @@ static void *exp_run(void *arg) {
                             (long)g->dims[0], (long)g->dims[1], j->Lat,
                             w0[0], w0[1], w0[2], w0[3],
                             s0[0], s0[1], s0[2], s0[3]);
+                    /* decode row 0 elements 0..15 with the engine's own
+                     * pointers: q*s+b, group 0 */
+                    for (int c = 0; c < 16; c++) {
+                        int q = (int)((w0[c >> 3] >> (4 * (c & 7))) & 0xFu);
+                        float s, bb = 0.0f;
+                        uint32_t sb = (uint32_t)s0[c / 64] << 16;
+                        memcpy(&s, &sb, 4);
+                        if (b0) {
+                            uint32_t bb2 = (uint32_t)b0[c / 64] << 16;
+                            memcpy(&bb, &bb2, 4);
+                        }
+                        fprintf(stderr, "[expw] row0[%d] q=%d s=%.6g b=%.6g "
+                                "W=%.6g\n", c, q, (double)s, (double)bb,
+                                (double)((float)q * s + bb));
+                    }
                 }
                 _exp106_dumped = 1;
                 }

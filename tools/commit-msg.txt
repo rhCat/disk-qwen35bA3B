@@ -1,0 +1,35 @@
+FIDELITY AUDIT: engine now bit-matches the mlx-lm reference through every
+layer boundary except the 4-bit expert decode.
+
+Engine fixes (src/):
+- q/k normalization semantics (attn_qwen.c): the reference is rms_norm with
+  eps on the MEAN (x/sqrt(mean(x^2)+1e-6) then inv_scale^2 / inv_scale for
+  q/k); the engine used l2norm with eps on the SUM, which deviates for
+  small-norm heads (433/2048 k elements off ~1%). Now exact: q/k match 0/2048.
+- router input (main.c): the MoE router was fed the RAW post-attention state
+  (rms 0.03 -> near-uniform softmax -> flat topk weights). The reference
+  routes on post_attention_layernorm(state). Applied ffn_norm before the gate
+  matvec. L0 router selection+weights now IDENTICAL to ref.
+- shared expert silu (moe.c): chain was sigmoid(g)*up; reference is
+  silu(g)*up = g*sigmoid(g)*up. L0 moe-acc 0.0122 -> 0.0131 (ref 0.0140).
+- up-proj matvec aliasing (moe.c): ux aliased cur (x==y in the matvec) ->
+  row-over-row input corruption once row r overwrote cur[0..511] while later
+  rows still read cur. ux now tmp+M.
+- diagnostic hardening: mutex-serialized self-describing expert dumps (the 8
+  worker threads raced on the flag -> mismatched expert data), --no-simd
+  pass-through in run-real.sh, DUMPARG empty-array fix.
+
+Verification harness (tools/dbg-*.py): stage-by-stage elementwise comparison
+vs a Python port of mlx-lm qwen3_5.py (dbg-reffwd.py). Proven bit-faithful:
+embed, z, pre/post-conv qkv, v, q/k norms, delta-rule readout, a/b proj, MoE
+input (cos 1.0), L0 router. Reference-script bugs fixed along the way:
+per-head RMSNormGated w/ learned weight, delta-rule transpose (S.T @ q /
+S.T @ k), interleaved RoPE pairs (2i,2i+1), 'for h in range(HEADS)'
+clobbering the hidden-state h (was the L3 'explosion' to rms 15), phantom
+prompt token (npids=5 read as an id).
+
+REMAINING: routed-expert outputs ~2^32 x the reference (cos 0.6-0.8,
+rms 1e9 vs 0.3) with correct input/weights/kernel args -- signature of an
+exponent-bit/sign flip in the 4-bit scale decode specific to the pool
+tensors (trunk projections decode correctly). Next: dump one decoded scale
+row vs the manifest at the matvec entry.

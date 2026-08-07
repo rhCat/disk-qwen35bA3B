@@ -263,8 +263,9 @@ for t in range(T):
         else:
             # GQA attention
             qout = proj(layer, '.self_attn.q_proj', xin, HEADS * HD * 2)
-            q = qout[:HEADS * HD].reshape(HEADS, HD)
-            gate = qout[HEADS * HD:].reshape(HEADS, HD)
+            qout = qout.reshape(HEADS, HD * 2)   # head-major: [q|gate]
+            q = qout[:, :HD]
+            gate = qout[:, HD:]
             k = proj(layer, '.self_attn.k_proj', xin, KVH * HD).reshape(KVH, HD)
             v = proj(layer, '.self_attn.v_proj', xin, KVH * HD).reshape(KVH, HD)
             qn = ten_float(layer, '.self_attn.q_norm.weight')
@@ -352,6 +353,9 @@ for t in range(T):
                 float(rout_r), float(np.sqrt((sd**2).mean())),
                 float(sgate)), flush=True)
         h = h + acc
+        if t > 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1):
+            print('t%d L%d state rms %.4g' % (t, L,
+                  float(np.sqrt((h**2).mean()))), flush=True)
         if t == 0 and L == 0:
             acc.astype(np.float32).tofile('/tmp/q35-ref-moeacc0.bin')
         if t == 0 and L == 0:
@@ -365,11 +369,15 @@ for t in range(T):
     fn = ten_float(tl['layers'][-1], '.norm.weight')
     if fn is None:
         fn = np.ones(H, dtype=np.float32)
+    h_pre = h.copy()
     h = rmsnorm(h, fn, 1e-6)
     if t == T - 1 and (L == 0 or L % 8 == 0 or L == N_LAYERS - 1):
         print('t%d L%d state rms %.4g' % (t, L, float(np.sqrt((h**2).mean()))),
               flush=True)
-    out_states.append(h)
+    if t > 0 and (L == 0 or L == 8 or L == N_LAYERS - 1):
+        print('t%d L%d state rms %.4g' % (t, L, float(np.sqrt((h**2).mean()))),
+              flush=True)
+    out_states.append(h_pre)   # PRE-final-norm (engine dumps pre-norm)
 
 final = out_states[-1]
 np.savetxt('/tmp/q35-ref-state.txt', final, fmt='%.6e')
