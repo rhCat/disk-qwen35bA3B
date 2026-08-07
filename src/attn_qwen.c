@@ -705,7 +705,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         for (int i = 0; i < vd; i++) h0 += (double)readout[i] * readout[i];
         fprintf(stderr, "[linout] L%d t%d readout-rms %.6g z-rms %.6g "
                 "o-rms %.6g q-pre rms %.6g head0-r %.6g nw0..3 %.4g %.4g %.4g %.4g "
-                "z[0..3] %.4g %.4g %.4g %.4g silu-z[0..3] %.4g %.4g %.4g %.4g\n",
+                "z[0..3] %.4g %.4g %.4g %.4g xin[0..3] %.4g %.4g %.4g %.4g\n",
                 L, token,
                 sqrt(r2 / (v_heads * vd)), sqrt(z2 / (v_heads * vd)),
                 sqrt(o2 / H), sqrt(q2 / (k_heads * kd)),
@@ -715,8 +715,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 bf16_f(((const uint16_t *)(const void *)(tr + tl->t[ni].off))[2]),
                 bf16_f(((const uint16_t *)(const void *)(tr + tl->t[ni].off))[3]),
                 z[0], z[1], z[2], z[3],
-                z[0]/(1+expf(-z[0])), z[1]/(1+expf(-z[1])),
-                z[2]/(1+expf(-z[2])), z[3]/(1+expf(-z[3])));
+                xin[0], xin[1], xin[2], xin[3]);
     }
     for (int i = 0; i < H; i++) state[i] += o[i];
 

@@ -354,6 +354,9 @@ int ds4f_embed_gather(const Ds4fEmbed *e, int tok, float *out) {
                 uint32_t bb = (uint32_t)bias[(size_t)tok * G + g] << 16;
                 memcpy(&b, &bb, 4);
             }
+            if (getenv("DS4F_NAN_PROBE") && tok == 760 && i < 8)
+                fprintf(stderr, "[embg] i=%d q=%d g=%d s=%.8g b=%.8g -> %.8g\n",
+                        i, q, g, s, b, (float)q * s + b);
             out[i] = (float)q * s + b;
         }
     } else {

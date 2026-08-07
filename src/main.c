@@ -892,8 +892,18 @@ int main(int argc, char **argv) {
             }
             int tokid = -1;
             if (gen_t < 0) {
-                /* prompt pass: no sampling, no output -- the forward
-                 * ran so the caches saw this token */
+                /* prompt pass: no output -- but the LAST prompt token's
+                 * logits predict the FIRST generated token. Capture that
+                 * sample so generation continues from it; otherwise the
+                 * first gen step re-feeds pids[0] and the model echoes
+                 * the prompt forever (saw: "capital of France isThe..."). */
+                if (t == npids - 1) {
+                    if (getenv("DS4F_GREEDY"))
+                        last_tok = ds4f_argmax(logits, (int)head.dims[0]);
+                    else
+                        last_tok = ds4f_sample(logits, (int)head.dims[0],
+                                               &rng);
+                }
             } else if (getenv("DS4F_GREEDY"))
                 tokid = ds4f_argmax(logits, (int)head.dims[0]);
             else if (getenv("DS4F_TEMP")) {

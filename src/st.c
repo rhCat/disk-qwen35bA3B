@@ -160,6 +160,12 @@ int ds4f_pool_open_packed(Ds4fExpertPool *pool, const char *path,
         return -1;
     }
     pool->fd = fd;
+#ifdef __APPLE__
+    /* macOS: pread pages land in the unified page cache and get attributed
+     * to this process (Activity Monitor shows GBs of file-backed memory).
+     * F_NOCACHE = bypass the page cache for pool reads. */
+    fcntl(fd, F_NOCACHE, 1);
+#endif
     pool->n_layers = (int)n_layers;
     pool->n_experts = (int)n_experts;
     pool->nbytes = nbytes;

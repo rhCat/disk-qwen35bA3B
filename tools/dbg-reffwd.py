@@ -140,7 +140,7 @@ RDD = 64   # rotary dims (partial 0.25 * 256)
 
 # ---- prompt (the engine's actual ids: "The capital of France is" ->
 # 760 6511 314 9338 369 -- the engine's "prompt ids: 5 ..." is COUNT=5)
-pids = [760, 6511, 314, 9338, 369]
+pids = [760, 6511, 314, 9338, 369, 35]
 T = len(pids)
 print('prompt tokens:', pids)
 
@@ -253,12 +253,12 @@ for t in range(T):
             r = proj(layer, '.linear_attn.out_proj', gated.reshape(-1), H)
             if t == 0 and L == 0:
                 print('ref L0: linear r rms %.4g readout-rms %.4g '
-                      'silu-z rms %.4g z[0..3] %s silu-z[0..3] %s' % (
+                      'silu-z rms %.4g z[0..3] %s xin[0..3] %s' % (
                     float(np.sqrt((r**2).mean())),
                     float(np.sqrt((readout**2).mean())),
                     float(np.sqrt((silu(z.reshape(-1))**2).mean())),
                     z.reshape(-1)[:4].tolist(),
-                    silu(z.reshape(-1))[:4].tolist()),
+                    xin[:4].tolist()),
                     flush=True)
         else:
             # GQA attention
@@ -320,7 +320,8 @@ for t in range(T):
         gates = gates / gates.sum()
         inds = np.argsort(gates)[-TOPK:][::-1]
         topw = gates[inds]
-        topw = topw / topw.sum()
+        # mlx-lm qwen3_next.py: softmax probs used RAW -- renorm only if
+        # norm_topk_prob (absent from config -> default False). NO renorm.
         acc = np.zeros(H, dtype=np.float32)
         if t == 0 and L in (0, 1, 2):
             print('ref L%d: sel=%s w=%s xin2=%.4g' % (L, inds.tolist(),
@@ -353,7 +354,7 @@ for t in range(T):
                 float(rout_r), float(np.sqrt((sd**2).mean())),
                 float(sgate)), flush=True)
         h = h + acc
-        if t > 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1):
+        if (t == 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1)) or (t > 0 and L in (0, 8, 16, 24, 32, N_LAYERS - 1)):
             print('t%d L%d state rms %.4g' % (t, L,
                   float(np.sqrt((h**2).mean()))), flush=True)
         if t == 0 and L == 0:

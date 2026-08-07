@@ -543,22 +543,20 @@ void ds4f_topk(const float *scores, int E, int k, int *idx, float *w) {
             w[j + 1] = s;
         }
     }
-    /* Qwen3.5 SwitchMLP routing: softmax over ALL expert scores, then
-     * renormalize the selected top-k weights to sum 1 (the reference
-     * does routing_weights = softmax(gate_logits); topk; /= sum).
-     * The selected w[] currently holds the raw top-k logits. */
+    /* Qwen3.5 SwitchMLP routing: softmax over ALL expert scores, keep the
+     * selected top-k SOFTMAX PROBABILITIES RAW -- mlx-lm qwen3_next.py
+     * renormalizes only if norm_topk_prob (absent from this model's
+     * config -> default False). The previous /= sum was a deviation from
+     * the reference (amplified routed experts 2-5x, destroyed the
+     * attention/shared-expert balance). The selected w[] holds raw
+     * top-k logits; convert to softmax probs, no renorm. */
     double mx = -1e30, sw = 0.0;
     for (int e = 0; e < E; e++)
         if ((double)scores[e] > mx) mx = (double)scores[e];
     for (int e = 0; e < E; e++)
         sw += exp((double)scores[e] - mx);
-    double ss = 0.0;
-    for (int j = 0; j < k && idx[j] >= 0; j++) {
+    for (int j = 0; j < k && idx[j] >= 0; j++)
         w[j] = (float)(exp((double)w[j] - mx) / sw);
-        ss += (double)w[j];
-    }
-    if (ss > 0.0)
-        for (int j = 0; j < k && idx[j] >= 0; j++) w[j] = (float)(w[j] / ss);
 }
 
 /* Parallel expert chain job (issue #5): one per topk expert, run on its

@@ -52,6 +52,9 @@ int ds4f_trunk_open(Ds4fTrunk *tr, const char *bin_path, const char *off_path) {
     close(ofd);
 
     tr->fd = open(bin_path, O_RDONLY);
+#ifdef __APPLE__
+    fcntl(tr->fd, F_NOCACHE, 1);
+#endif
     if (tr->fd < 0) {
         fprintf(stderr, "trunk: cannot open %s: %s\n", bin_path, strerror(errno));
         return -1;

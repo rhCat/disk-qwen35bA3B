@@ -1,9 +1,7 @@
 # Fidelity Audit: ds4f engine vs mlx-lm reference (Qwen3.5-35B-A3B)
 
-Status: **OPEN** — one divergence remains, localized to the L0 embedding path.
-The reference (mlx-lm `models/qwen3_5.py` + `qwen3_next.py` + `gated_delta.py`,
-the implementation that actually serves this repo) is ground truth. Where they
-differ, the engine is wrong.
+Status: **RESOLVED — the engine now matches the reference and generates
+coherent English.** Two real bugs were found and fixed (see below).
 
 ## Harness
 
