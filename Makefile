@@ -44,6 +44,14 @@ make-fixture: tools/make-fixture.c $(HDR)
 bench-kernels: tools/bench-kernels.c $(SRC) $(HDR) $(GPU_SRC:.mm=.o)
 	$(CC) $(CFLAGS) $(INC) -o $@ tools/bench-kernels.c $(filter-out %.mm,$(SRC)) $(GPU_SRC:.mm=.o) -lm $(GPU_LIBS)
 
+# GPU expert offload microbenchmark (Darwin only): one expert layer,
+# CPU 8-thread vs the existing per-matvec Metal API. Links only the
+# kernels it needs (kernels.c + simd.c + the Metal shim) -- head.c and
+# the rest of the engine are C99 and don't compile as C++.
+BENCH_GPU_SRC = src/kernels.c src/simd.c $(GPU_SRC:.mm=.o)
+bench-gpu-experts: tools/bench-gpu-experts.mm $(BENCH_GPU_SRC) $(HDR)
+	$(CXX) $(CXXFLAGS) $(INC) -o $@ tools/bench-gpu-experts.mm $(BENCH_GPU_SRC) -lm $(GPU_LIBS)
+
 test: all
 	./tests/run_tests.sh
 	bash tools/test-memlimit.sh

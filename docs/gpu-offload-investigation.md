@@ -1,79 +1,78 @@
 # GPU expert offload — investigation (feat/gpu-expert-offload)
 
-Status: **investigation only — no working offload yet.** Branch off
-`02a1341` (the validated row-split main).
+Status: **MICROBENCHMARKED — the batched offload is a 13x win.**
+Branch off `02a1341` (the validated row-split main).
 
-## Why the head-only Metal path measured as a non-win
+## The measurement (tools/bench-gpu-experts.mm, Apple M4 Pro)
 
-`src/gpu_metal.mm` offloads ONE matvec: the 248320-row output head.
-Measured parity (~0.26 vs 0.24 s/token) because the head is ~12% of the
-per-token work. The expert matvecs — the ~88% — stayed on CPU.
+One expert layer = 8 routed experts x 3 tensors (gate/up 512x2048,
+down 2048x512). 30 reps, best-stable run:
 
-## The expert offload problem, from the code
+| path | ms/layer | us/matvec | vs CPU |
+|---|---|---|---|
+| CPU (8 threads, fused NEON, row-split) | 15.34 | 639 | 1.00x |
+| GPU per-matvec API (24 dispatches) | 9.14 | 381 | 0.60x |
+| **GPU batched (1 dispatch, all 24)** | **1.16** | **48** | **0.08x = 13x faster** |
 
-The Metal kernel is a single-shot `ds4f_gpu_mlx4_matvec` with **cached
-weight buffers**. The expert path is fundamentally different:
+Variance note: the per-matvec path wandered 0.60x-1.02x between runs
+(dispatch + sync overhead swamps the compute at this size); the
+batched path was stable ~0.08x.
 
-1. **Shape volatility.** Experts are 512×2048 / 2048×512 per layer, but
-   the *routed* set changes every token (top-8 of 256). The Metal code
-   rebuilds weight buffers when `R/C/pointers` change — with experts,
-   the pointer set changes EVERY token (8 experts × 3 tensors × 40
-   layers = 960 buffer (re)creations/token). The cache-hit design that
-   makes the head cheap is inapplicable.
+## Why the batched design wins (the code-level answer)
 
-2. **Buffer churn.** Each expert tensor is ~1-2 MB. 960 uploads/token at
-   M4 bandwidth (~200 GB/s) = ~10 ms/token of pure transfer — HALF the
-   current 17 ms/token budget. Uploading 4-bit weights that the GPU then
-   dequantizes loses to the CPU's already-resident cache.
+1. **Weights resident, uploaded once.** All 24 tensors sit in shared
+   memory buffers (MTLResourceStorageModeShared) across tokens; the
+   routed set changes per token but the pool tensors are the same
+   objects -- buffer pointers do not change, so no re-upload (the
+   per-matvec API's cache miss every token was the old cost).
+2. **One dispatch, no per-matvec sync.** The per-matvec API does
+   command-buffer commit + waitUntilCompleted 24x/token; the batched
+   kernel does it once. On unified memory the "transfers" were never
+   the cost -- the dispatch/sync overhead was.
+3. **GPU width on the flattened grid.** 24 jobs x up-to-2048 rows in
+   one dispatch; the M4 GPU's ~5 TFLOPs chew the dequant-FMA loop far
+   past 8-thread NEON.
+4. **Dequant is parallel, not cheaper** -- the kernel still does
+   q*s+b per element, but 49152 threads do it simultaneously.
 
-3. **Dequant is the same cost on GPU.** The kernel does `q*s+b` per
-   element (line 40-47) — identical math to the NEON path. The GPU's
-   win would be *width* (many rows in parallel), but expert rows are
-   only 512-2048 wide; the CPU already does 8 rows in parallel per
-   thread × 8 threads.
+## Predicted engine impact
 
-4. **Synchronization.** `waitUntilCompleted` per matvec serializes; a
-   batched kernel over all 8 experts per layer would help, but the
-   routing happens per-layer in C, so batching crosses the engine's
-   control flow.
+Expert path ~= 88% of 0.17 s/token. Batched offload:
+- experts: ~1.16 ms/layer x 40 layers = ~46 ms/token
+- attention + rest: ~20 ms/token (0.17 - 0.15 expert)
+- **projected ~0.06-0.07 s/token = 14-16 tok/s (vs 5.9 now)**
 
-## What WOULD make GPU offload win (the real design)
+RSS: pool tensors resident in shared memory (the 4-5 GB cache shrinks
+to what the GPU needs) -- likely a wash vs the 5.8 GB measured.
 
-| design | transfer/token | why it could win |
-|---|---|---|
-| **Whole-pool resident on GPU** | 0 (weights pre-uploaded once) | the 16.88 GB pool at ~200 GB/s = 84 ms once; then per-token only x/y (KB) |
-| **Batched per-layer kernel** | 8 experts × 3 = 24 tensors, one dispatch | one launch, no per-matvec sync; GPU width on 24 parallel matvecs |
-| **Persistent expert buffers** | rebuild only when a new expert first enters cache | after warmup, ~0 churn |
+## Integration design (next branch of work)
 
-The whole-pool design is the only one that clears the transfer bound —
-but it needs **16.88 GB of GPU memory**. M4 Pro (this Mac) has a unified
-memory pool; the engine's 8 GB target means the pool would be
-shared-memory resident anyway (MTLResourceStorageModeShared), so
-"upload" is mostly a page-map, not a copy. That's the crux: on unified
-memory, **the transfer argument partly evaporates** — the real question
-is whether the GPU's SIMD width beats the CPU's 8-thread NEON on
-512-wide rows.
+`ds4f_gpu_mlx4_batch(jobs[], njobs)` API in gpu.h/gpu_metal.mm:
+- concat pool tensors once at init (or cache per-expert buffers)
+- per-token: build the 8-expert desc table (R, C, xoff, yoff) -- the
+  ONLY per-token work, ~24 uint4s
+- one dispatch; read back 24 y-slices
+- fall back to the CPU path per-call on failure (same contract as the
+  head offload)
 
-## Verdict
+Integration point: `ds4f_moe_step` -- replace the per-expert exp_run
+matvecs with the batched call when `--gpu`/`DS4F_GPU=1`; keep the CPU
+path default for byte-determinism (GPU reduction order differs by
+float32 rounding, documented in gpu.h).
 
-**GPU expert offload is possible but not a clear win on this machine.**
-The honest next step is a **microbenchmark**, not a full implementation:
-time one expert layer's 8×3 matvecs on Metal (whole-pool resident,
-batched single dispatch) vs the current CPU path (8 threads, fused
-NEON). If the GPU doesn't beat ~0.3 ms/layer, the offload is
-theoretically sound but practically pointless here — the answer would
-then be "keep CPU, the pool stays on disk" (the original design intent).
+## Open questions before implementation
 
-## Next steps on this branch
+1. **Routing dependency**: gate (router) scores must be computed before
+   the expert set is known; the router itself is a 40x2048 matvec --
+   can batch that too (one more job).
+2. **Shared-expert tensors** (moe.c:1127-1153) are per-layer, not
+   routed -- include them in the same dispatch.
+3. **Precision gate**: verify the batched kernel's logits match the
+   CPU path within the documented float32 tolerance on a real token
+   (e2e_trace tolerance, not byte-exact).
 
-1. `tools/bench-gpu-experts.mm` — microbenchmark (one layer, 24 tensors,
-   batched Metal vs CPU)
-2. If GPU wins: `ds4f_gpu_mlx4_batch()` API + integration in
-   `ds4f_moe_step`
-3. If not: document the measurement, close the branch with the verdict
+## Prior steps (main)
 
-## Measurements so far (from main)
-
-- Row-split main: **0.19 s/token at 2K context** (2017-token QA bench)
-- 5.9 tok/s short-context; RSS 4.9-5.8 GB
-- Expert path = ~960 matvecs/token, the 0.17-0.19 s floor
+- Row-split main: 0.19 s/token @ 2K, 5.9 tok/s, RSS 4.9-5.8 GB
+- malloc kill + fusion: 0.24 -> 0.23 s/token
+- context-aware row-split: 0.23 -> 0.17 s/token
