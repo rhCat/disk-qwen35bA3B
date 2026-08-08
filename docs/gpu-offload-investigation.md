@@ -76,3 +76,11 @@ float32 rounding, documented in gpu.h).
 - Row-split main: 0.19 s/token @ 2K, 5.9 tok/s, RSS 4.9-5.8 GB
 - malloc kill + fusion: 0.24 -> 0.23 s/token
 - context-aware row-split: 0.23 -> 0.17 s/token
+
+## 4K long-context test (2026-08-07)
+
+4017-token QA, GEN=8, cache 5 / pin 4, greedy:
+- per-token 0.231 s (vs 0.192 at 2K = 1.20x context cost)
+- trunk read flat at 693 MB/token (never disk-bound)
+- cache hit 68.4% (vs 77.2% at 2K)
+- PEAK RSS 5.66 GB
