@@ -128,3 +128,42 @@ DS4F_WATERFALL=1 bash tools/run-clean.sh ./ds4f /tmp/q35-trunk \
   --tokenizer ~/.cache/huggingface/mlx-qwen35-a3b-4bit/tokenizer.json \
   --pids-file /tmp/q35-2k-ids.txt --gen 8 --cache-gb 5 --pin-layers 4
 ```
+## Chunked prefill (DS4F_PREFILL_CHUNK) — bit-identical batched attention
+
+The prompt pass batches the linear-attention projections (qkv+z, M1) and
+the GQA projections (q/k/v + o_proj, M3-lite) over B=64 tokens while
+preserving the EXACT sequential accumulator map of the serial SIMD
+matvec (the `(c>>2)&7` 8-accumulator topology, same FMA chains, same
+reduction order). The recurrent bodies (Gated DeltaNet state chain,
+GQA softmax over the growing K cache) stay serial per token. Verified
+bit-identical against the ENGINE matvec (`tests/verify_batch2.c`).
+
+### A/B table (greedy, 8 gen tokens, single-flight)
+
+| prompt | serial | chunked | Δ | gen top1 identical |
+|---|---|---|---|---|
+| 200 tok | 31.7s | 24.7s | −22% | 8/8 |
+| 500 tok | 83.3s | 62.4s | −25% | 8/8 |
+| 1500 tok | 255.2s | 199.8s | −22% | 8/8 |
+| 3000 tok | (see run) | (see run) | — | — |
+
+Bugs found & fixed during the work (all documented in commit bodies):
+absolute MLX4 group indexing in the batch kernel; double prompt
+processing after the chunked pass (153s→72s); `gqa_step` zeroing only
+HALF of attn_out (orows vs ocols — stale heads 8-15, masked by the
+serial path's full-arena memset, exposed by the chunk; the 1500-tok
+A/B went 0/24 → 8/8 after the fix); `lin_body` missing `return 0;`;
+`last_tok` not captured by the chunk pass.
+
+Rejected with data: M2 batched-moe (grouped experts measured 2× slower
+at B=64 — routing diversity gives 2-4 tokens/expert, killing the
+dequant amortization). See `docs/breakdown.md` for the full candidate
+analysis and the M3-lite decision.
+
+### Transmutation close-out (f7222137, after M3-lite merge)
+
+calcination: commit proven (f7222137259b), 240 blueprints / 374
+functions / 471 evidence. citrinitas ground: **Contradictions 0**
+(ErrorPropagation 406, GateInventory 65, 362 flows) — the symmetry
+regression oracle stays green through the full perf arc
+(strdup-era 1 → 0 at 8bab9995 → 0 at a31a1a48 → 0 at f7222137).
