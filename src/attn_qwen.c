@@ -79,6 +79,11 @@ static int mlx4_proj(const Ds4fTrunkLayout *tl, int wi, int si, int bi,
  *   attn = softmax(q k^T / sqrt(256)) v         (GQA, repeat_kv 8)
  *   out = o_proj(attn * sigmoid(gate))
  */
+/* forward decl: the shared GQA serial body (defined after gqa_step) --
+ * both gqa_step (serial) and gqa_chunk (batched projections) call it */
+static int gqa_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
+                    const uint8_t *tr, Ds4fKvCache *kv, int token,
+                    float *q, float *k, float *v, float *attn_out);
 static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                     const uint8_t *tr, float *state, Ds4fKvCache *kv,
                     int token) {
@@ -159,13 +164,112 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         return -1;
     }
     /* split q | gate: q is the first 256 of each 512-head, gate the
-     * rest. q_norm over the full 256-dim head. */
-    const uint16_t *qwn = (const uint16_t *)(const void *)(tr + tl->t[qn].off);
-    const uint16_t *kwn = (const uint16_t *)(const void *)(tr + tl->t[kn].off);
-    /* arena slices (after buf): gate/qq/kk then cos/sin then
-     * scores/wgt -- all fixed offsets from kv->scratch, no per-call
-     * allocation. attn_out is ocols wide (16 heads x 256). */
-    float *gate = attn_out + ocols;
+     * rest. q_norm over the full 256-dim head. (moved into gqa_body) */
+    if (gqa_body(cfg, tl, L, tr, kv, token, q, k, v, attn_out) != 0)
+        return -1;
+    /* the body's arena slices (gate/qq/kk/cos/sin/scores/wgt) follow
+     * attn_out inside kv->scratch -- the probes below read them. */
+    {
+        int heads = cfg->n_heads > 0 ? cfg->n_heads : 16;
+        int kh = krows / (cfg->n_kv_heads > 0 ? cfg->n_kv_heads : 2);
+        float *gate = attn_out + ocols;
+        float *qq = gate + (size_t)heads * kh;
+        if (getenv("DS4F_NAN_PROBE") && L == 3) {
+            double q2 = 0.0, a2 = 0.0, g2 = 0.0;
+            float gmin = 1e30f, gmax = -1e30f;
+            for (int i = 0; i < heads * kh; i++) {
+                q2 += (double)qq[i] * qq[i];
+                a2 += (double)attn_out[i] * attn_out[i];
+                if (gate[i] < gmin) gmin = gate[i];
+                if (gate[i] > gmax) gmax = gate[i];
+            }
+            for (int i = 0; i < vrows; i++) g2 += (double)v[i] * v[i];
+            fprintf(stderr, "[gqa] L3 q-rms %.6g attn-rms %.6g v-rms %.6g "
+                    "gate[%.4g, %.4g] heads=%d kh=%d qh=%d qrows=%d\n",
+                    sqrt(q2 / (heads * kh)), sqrt(a2 / (heads * kh)),
+                    sqrt(g2 / vrows), gmin, gmax, heads, kh,
+                    qrows / heads, qrows);
+        }
+    }
+    /* o_proj(attn_out) -> o; residual add. attn_out is ocols wide
+     * (16 heads x 256); o_proj is [orows=2048 x ocols=4096]. */
+    if (mlx4_proj(tl, oi, os, ob, tr, orows, ocols, attn_out, o) != 0) {
+        return -1;
+    }
+    if (getenv("DS4F_NAN_PROBE") && (L == 3 || L == 7)) {
+        double o2 = 0.0, a2 = 0.0;
+        for (int i = 0; i < H; i++) o2 += (double)o[i] * o[i];
+        for (int i = 0; i < ocols; i++)
+            a2 += (double)attn_out[i] * attn_out[i];
+        fprintf(stderr, "[gqa] L%d o_proj-rms %.6g attn-rms(4096) %.6g "
+                "ratio %.3g\n", L, sqrt(o2 / H), sqrt(a2 / ocols),
+                sqrt(o2 / H) / (sqrt(a2 / ocols) + 1e-30f));
+        if (token == 1 && L == 7) {
+            FILE *gf = fopen("/tmp/q35-eng-gqa7.bin", "wb");
+            if (gf) {
+                fwrite(attn_out, sizeof(float), (size_t)ocols, gf);
+                fclose(gf);
+            }
+        }
+        if (token == 7 && L == 3) {
+            FILE *gf = fopen("/tmp/q35-eng-gqa-L3-t7.bin", "wb");
+            if (gf) {
+                fwrite(attn_out, sizeof(float), (size_t)ocols, gf);
+                fclose(gf);
+            }
+        }
+    }
+    for (int i = 0; i < H; i++) state[i] += o[i];
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* GQA serial body: q|gate split, norms, RoPE, cache write, softmax   */
+/* attention, gate multiply -> attn_out. q/k/v are PRECOMPUTED (the   */
+/* caller projects them: mlx4_proj serial, or the batched kernel in   */
+/* the chunk path). This body is the bit-fidelity anchor -- both      */
+/* paths run the identical code on the same q/k/v, so results are     */
+/* bit-identical as long as the projections are.                      */
+/* ------------------------------------------------------------------ */
+static int gqa_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
+                    const uint8_t *tr, Ds4fKvCache *kv, int token,
+                    float *q, float *k, float *v, float *attn_out) {
+    int qi = tl->q3_q[L], qs = tl->q3_qs[L], qb = tl->q3_qb[L];
+    int ki = tl->q3_k[L], ks = tl->q3_ks[L], kb = tl->q3_kb[L];
+    int vi = tl->q3_v[L], vs = tl->q3_vs[L], vb = tl->q3_vb[L];
+    int qn = tl->q3_qn[L], kn = tl->q3_kn[L];
+    if (qi < 0 || ki < 0 || vi < 0 || qn < 0 || kn < 0)
+        return -1;
+    int qrows = (int)tl->t[qi].dims[0];       /* 8192 = 16 heads x 512 */
+    int krows = (int)tl->t[ki].dims[0];       /* 512 = 2 kv x 256 */
+    int vrows = (int)tl->t[vi].dims[0];
+    int orows = (int)tl->t[tl->q3_o[L]].dims[0];   /* 2048 */
+    int ocols = (int)tl->t[tl->q3_o[L]].dims[1] * 8;  /* 4096 */
+    int heads = cfg->n_heads > 0 ? cfg->n_heads : 16;
+    int kv_heads = cfg->n_kv_heads > 0 ? cfg->n_kv_heads : 2;
+    int qh = heads > 0 ? qrows / heads : qrows;   /* 512 */
+    int kh = krows / kv_heads;                    /* 256 */
+    if (qrows <= 0 || krows <= 0 || vrows <= 0 || heads < 1 ||
+        kv_heads < 1 || kh < 1)
+        return -1;
+    if (token < 0 || !kv || !kv->kv || token >= kv->max_tokens) return 0;
+    int kvlat = krows + vrows;
+    if (kv->kvlat != kvlat && kv->kvlat != 0) return 0;
+
+    /* working slices live in kv->scratch (the shared arena), NOT
+     * relative to attn_out: the chunk path passes an attn_out that
+     * is a per-token row inside its own buffer, and the arena must
+     * be stable across the B serial body calls. The layout matches
+     * gqa_step's (xin..o unused here, but the same offsets keep the
+     * serial path bit-identical). */
+    float *buf = kv->scratch;
+    float *q2 = buf + (size_t)cfg->hidden;              /* qrows */
+    float *k2 = q2 + qrows;                             /* krows */
+    float *v2 = k2 + krows;                             /* vrows */
+    float *o2 = v2 + vrows;                             /* orows */
+    float *a2 = o2 + orows;                             /* ocols */
+    float *gate = a2 + ocols;
     float *qq = gate + (size_t)heads * kh;
     float *kk = qq + (size_t)heads * kh;
     float *cos_t = kk + (size_t)heads * kh;         /* 64 floats */
@@ -181,6 +285,8 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         memcpy(gate + (size_t)h * kh, hq + kh, (size_t)kh * sizeof(float));
     }
     /* q_norm / k_norm: RMSNorm per head over the full 256 dims */
+    const uint16_t *qwn = (const uint16_t *)(const void *)(tr + tl->t[qn].off);
+    const uint16_t *kwn = (const uint16_t *)(const void *)(tr + tl->t[kn].off);
     for (int h = 0; h < heads; h++)
         rmsnorm(qwn, kh, qq + (size_t)h * kh);
     for (int h = 0; h < kv_heads; h++)
@@ -191,12 +297,8 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     {
         int rd = (int)(kh * 0.25f);              /* 64 */
         double theta = 10000000.0;
-        /* cos_t/sin_t are arena slices (defined with the other slices) */
         memset(cos_t, 0, (size_t)rd * sizeof(float));
         memset(sin_t, 0, (size_t)rd * sizeof(float));
-        /* mrope_interleaved: dims 0..rd-1 get rope pairs (d, d+1) --
-         * interleaved layout means pair (2i, 2i+1). inv_freq over
-         * arange(0, rd, 2)/rd (the transformers rope init). */
         for (int i = 0; i < rd / 2; i++) {
             double inv = 1.0 / pow(theta, (double)(2 * i) / (double)rd);
             double f = (double)token * inv;
@@ -205,10 +307,6 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         }
         for (int h = 0; h < heads; h++) {
             float *hq = qq + (size_t)h * kh;
-            /* mlx nn.RoPE traditional=False: HALF-SPLIT pairs (d, d+rd/2),
-             * NOT interleaved (2i, 2i+1). Verified against mx.fast.rope.
-             * (mrope_interleaved in config is a transformers-ism; mlx-lm
-             * qwen3_next.py uses initialize_rope(traditional=False).) */
             for (int i = 0; i < rd / 2; i++) {
                 float x0 = hq[i], x1 = hq[i + rd / 2];
                 float c = cos_t[i], s = sin_t[i];
@@ -231,26 +329,9 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     float *ck = kv->kv + ((size_t)L * kv->max_tokens + token) * kvlat;
     memcpy(ck, k, (size_t)krows * sizeof(float));
     memcpy(ck + krows, v, (size_t)vrows * sizeof(float));
-    if (getenv("DS4F_DUMP_Z") && L == 3 && token == 0) {
-        FILE *xf = fopen("/tmp/q35-eng-gqak0.bin", "wb");
-        if (xf) {
-            fwrite(k, sizeof(float), (size_t)krows, xf);
-            fwrite(v, sizeof(float), (size_t)vrows, xf);
-            fclose(xf);
-        }
-        /* also dump the whole L3 K/V cache region (first 8 slots) */
-        FILE *cf = fopen("/tmp/q35-eng-gqakv3.bin", "wb");
-        if (cf) {
-            fwrite(kv->kv + (size_t)L * kv->max_tokens * kvlat,
-                   sizeof(float),
-                   (size_t)8 * kvlat, cf);
-            fclose(cf);
-        }
-    }
 
     /* attention: 16 q-heads over 2 kv-heads (repeat_kv 8), 0..token */
     float dscale = 1.0f / sqrtf((float)kh);
-    /* scores/wgt are arena slices (sized to max_tokens at init) */
     memset(scores, 0, (size_t)kv->max_tokens * sizeof(float));
     memset(wgt, 0, (size_t)kv->max_tokens * sizeof(float));
     /* BUGFIX: memset attn_out to ocols (4096), NOT orows (2048).
@@ -265,8 +346,6 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     int npos = token + 1;
     for (int h = 0; h < heads; h++) {
         const float *qh_ptr = qq + (size_t)h * kh;
-        /* GQA: kv head = h / (heads/kv_heads) -- repeat_kv grouping
-         * (q heads 0..7 -> kv head 0, 8..15 -> kv head 1) */
         int khh = h / (heads / kv_heads);
         float mx = -1e30f;
         for (int t2 = 0; t2 < npos; t2++) {
@@ -300,8 +379,7 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             const float *v2 = kv->kv +
                 ((size_t)L * kv->max_tokens + t2) * kvlat + krows +
                 (size_t)khh * kh;
-            float w = wgt[t2];   /* already normalized at line 260 --
-                                    do NOT divide by sum again */
+            float w = wgt[t2];
             for (int i = 0; i < kh; i++)
                 attn_out[(size_t)h * kh + i] += w * v2[i];
         }
@@ -315,83 +393,6 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             ao[i] *= 1.0f / (1.0f + expf(-gv));
         }
     }
-    if (getenv("DS4F_NAN_PROBE") && L == 3) {
-        double q2 = 0.0, a2 = 0.0, g2 = 0.0;
-        float gmin = 1e30f, gmax = -1e30f;
-        for (int i = 0; i < heads * kh; i++) {
-            q2 += (double)qq[i] * qq[i];
-            a2 += (double)attn_out[i] * attn_out[i];
-            if (gate[i] < gmin) gmin = gate[i];
-            if (gate[i] > gmax) gmax = gate[i];
-        }
-        for (int i = 0; i < vrows; i++) g2 += (double)v[i] * v[i];
-        fprintf(stderr, "[gqa] L3 q-rms %.6g attn-rms %.6g v-rms %.6g "
-                "gate[%.4g, %.4g] heads=%d kh=%d qh=%d qrows=%d\n",
-                sqrt(q2 / (heads * kh)), sqrt(a2 / (heads * kh)),
-                sqrt(g2 / vrows), gmin, gmax, heads, kh, qh, qrows);
-        if (qn >= 0) {
-            const uint16_t *qwnp = (const uint16_t *)(const void *)
-                (tr + tl->t[qn].off);
-            fprintf(stderr, "[gqa] L3 qn[0..3]=%.6g %.6g %.6g %.6g "
-                    "gate[0..3]=%.6g %.6g %.6g %.6g\n",
-                    bf16_f(qwnp[0]), bf16_f(qwnp[1]), bf16_f(qwnp[2]),
-                    bf16_f(qwnp[3]),
-                    gate[0], gate[1], gate[2], gate[3]);
-        }
-        if (getenv("DS4F_DUMP_Z") && token == 0) {
-            FILE *qf = fopen("/tmp/q35-eng-gqaq.bin", "wb");
-            if (qf) {
-                fwrite(qq, sizeof(float), (size_t)heads * kh, qf);
-                fwrite(gate, sizeof(float), (size_t)heads * kh, qf);
-                fclose(qf);
-            }
-            FILE *af = fopen("/tmp/q35-eng-gqaattn.bin", "wb");
-            if (af) {
-                fwrite(attn_out, sizeof(float), (size_t)ocols, af);
-                fclose(af);
-            }
-            FILE *xf = fopen("/tmp/q35-eng-gqaxin.bin", "wb");
-            if (xf) {
-                fwrite(xin, sizeof(float), (size_t)H, xf);
-                fclose(xf);
-            }
-            FILE *pf = fopen("/tmp/q35-eng-gqaproj.bin", "wb");
-            if (pf) {
-                fwrite(q, sizeof(float), (size_t)qrows, pf);
-                fclose(pf);
-            }
-        }
-    }
-    /* o_proj(attn_out) -> o; residual add. attn_out is ocols wide
-     * (16 heads x 256); o_proj is [orows=2048 x ocols=4096]. */
-    if (mlx4_proj(tl, oi, os, ob, tr, orows, ocols, attn_out, o) != 0) {
-        return -1;
-    }
-    if (getenv("DS4F_NAN_PROBE") && (L == 3 || L == 7)) {
-        double o2 = 0.0, a2 = 0.0;
-        for (int i = 0; i < H; i++) o2 += (double)o[i] * o[i];
-        for (int i = 0; i < ocols; i++)
-            a2 += (double)attn_out[i] * attn_out[i];
-        fprintf(stderr, "[gqa] L%d o_proj-rms %.6g attn-rms(4096) %.6g "
-                "ratio %.3g\n", L, sqrt(o2 / H), sqrt(a2 / ocols),
-                sqrt(o2 / H) / (sqrt(a2 / ocols) + 1e-30f));
-        if (token == 1 && L == 7) {
-            FILE *gf = fopen("/tmp/q35-eng-gqa7.bin", "wb");
-            if (gf) {
-                fwrite(attn_out, sizeof(float), (size_t)ocols, gf);
-                fclose(gf);
-            }
-        }
-        if (token == 7 && L == 3) {
-            FILE *gf = fopen("/tmp/q35-eng-gqa-L3-t7.bin", "wb");
-            if (gf) {
-                fwrite(attn_out, sizeof(float), (size_t)ocols, gf);
-                fclose(gf);
-            }
-        }
-    }
-    for (int i = 0; i < H; i++) state[i] += o[i];
-
     return 0;
 }
 
@@ -1088,6 +1089,123 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
         fprintf(stderr, "[chunk] L%d B=%d total %.2f ms (avg %.2f)\n",
                 L, B, (now_s() - _tch) * 1e3, _chk_acc[0] / _chk_n * 1e3);
     free(xs); free(bbuf);
+    return 0;
+}
+
+/* ---- M3-lite: chunked GQA (batched projections) ------------------- */
+/* Full-GQA layers (L3, L39): q/k/v + o_proj are batched over the
+ * chunk with the bit-identical kernel (one row-decode, B tokens
+ * through the same accumulator map); the attention body (norms,
+ * RoPE, softmax over past tokens, gate) stays SERIAL per token via
+ * gqa_body -- it reads the growing K cache, inherently sequential.
+ * Same code as gqa_step for the body, same kernel as M1 for the
+ * projections, so results are bit-identical to serial. */
+int ds4f_attn_gqa_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
+                        int L, const uint8_t *tr, float *const *states,
+                        int t0, int B, Ds4fKvCache *kv) {
+    int qi = tl->q3_q[L], qs = tl->q3_qs[L], qb = tl->q3_qb[L];
+    int ki = tl->q3_k[L], ks = tl->q3_ks[L], kb = tl->q3_kb[L];
+    int vi = tl->q3_v[L], vs = tl->q3_vs[L], vb = tl->q3_vb[L];
+    int oi = tl->q3_o[L], os = tl->q3_os[L], ob = tl->q3_ob[L];
+    int iln = tl->attn_norm[L];
+    if (qi < 0 || ki < 0 || vi < 0 || oi < 0 || !cfg || !kv) return -1;
+    int H = cfg->hidden;
+    int qrows = (int)tl->t[qi].dims[0];
+    int krows = (int)tl->t[ki].dims[0];
+    int vrows = (int)tl->t[vi].dims[0];
+    int orows = (int)tl->t[oi].dims[0];
+    int ocols = (int)tl->t[oi].dims[1] * 8;
+    int qcols = (int)tl->t[qi].dims[1] * 8;
+    if (qrows <= 0 || krows <= 0 || vrows <= 0 || qcols != H ||
+        B < 1 || t0 < 0) return -1;
+    long total = (long)H + (long)qrows + (long)krows + (long)vrows +
+                 (long)orows + (long)ocols;
+    float *xs = (float *)malloc((size_t)B * (size_t)total *
+                                sizeof(float));
+    if (!xs) return -1;
+    float *xins = xs;                          /* [B][H] row-major */
+    float *qb_ = xins + (size_t)B * H;         /* [B][qrows] */
+    float *kb_ = qb_ + (size_t)B * qrows;      /* [B][krows] */
+    float *vb_ = kb_ + (size_t)B * krows;      /* [B][vrows] */
+    float *ob_ = vb_ + (size_t)B * vrows;      /* [B][orows] */
+    float *aob = ob_ + (size_t)B * orows;      /* [B][ocols] */
+
+    /* 1) per-token input_layernorm into xins[B][H] (row-major) */
+    if (iln >= 0) {
+        const uint16_t *nw = (const uint16_t *)(const void *)(tr +
+                              tl->t[iln].off);
+        for (int b = 0; b < B; b++) {
+            const float *st = states[b];
+            float *xin = xins + (size_t)b * H;
+            double ss = 0.0;
+            for (int i = 0; i < H; i++) ss += (double)st[i] * st[i];
+            float r = sqrtf((float)(ss / (double)H) + 1e-6f);
+            for (int i = 0; i < H; i++) {
+                uint32_t bits = (uint32_t)nw[i] << 16;
+                float w;
+                memcpy(&w, &bits, 4);
+                xin[i] = st[i] / r * w;
+            }
+        }
+    } else {
+        for (int b = 0; b < B; b++)
+            memcpy(xins + (size_t)b * H, states[b],
+                   (size_t)H * sizeof(float));
+    }
+
+    /* 2) batched q/k/v projections (bit-identical kernel) */
+    if (ds4f_mlx4_matvec_batch(
+            (const uint32_t *)(const void *)(tr + tl->t[qi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[qs].off),
+            qb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[qb].off)
+                    : NULL,
+            qrows, qcols, B, xins, qb_) != 0 ||
+        ds4f_mlx4_matvec_batch(
+            (const uint32_t *)(const void *)(tr + tl->t[ki].off),
+            (const uint16_t *)(const void *)(tr + tl->t[ks].off),
+            kb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[kb].off)
+                    : NULL,
+            krows, qcols, B, xins, kb_) != 0 ||
+        ds4f_mlx4_matvec_batch(
+            (const uint32_t *)(const void *)(tr + tl->t[vi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[vs].off),
+            vb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[vb].off)
+                    : NULL,
+            vrows, qcols, B, xins, vb_) != 0) {
+        free(xs);
+        return -1;                 /* caller falls back to serial */
+    }
+
+    /* 3) per-token serial body: softmax attention over past tokens */
+    for (int b = 0; b < B; b++) {
+        float *aout = aob + (size_t)b * ocols;
+        if (gqa_body(cfg, tl, L, tr, kv, t0 + b,
+                     qb_ + (size_t)b * qrows,
+                     kb_ + (size_t)b * krows,
+                     vb_ + (size_t)b * vrows, aout) != 0) {
+            free(xs);
+            return -1;
+        }
+    }
+
+    /* 4) batched o_proj over the attention outputs */
+    if (ds4f_mlx4_matvec_batch(
+            (const uint32_t *)(const void *)(tr + tl->t[oi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[os].off),
+            ob >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[ob].off)
+                    : NULL,
+            orows, ocols, B, aob, ob_) != 0) {
+        free(xs);
+        return -1;                 /* caller falls back to serial */
+    }
+
+    /* 5) residual add */
+    for (int b = 0; b < B; b++) {
+        float *st = states[b];
+        const float *o = ob_ + (size_t)b * orows;
+        for (int i = 0; i < H; i++) st[i] += o[i];
+    }
+    free(xs);
     return 0;
 }
 

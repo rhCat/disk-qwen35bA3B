@@ -628,13 +628,21 @@ int main(int argc, char **argv) {
                             fprintf(stderr, "linear_step_chunk failed at L%d\n", L);
                             return 2;
                         }
-                    } else if (q3_layer) {
+                    } else if (q3_layer && tl.q3_q[L] >= 0) {
+                        /* M3-lite: batch the GQA projections (q/k/v +
+                         * o_proj); the softmax body stays serial */
                         double _tg0 = now_s();
-                        for (int b = 0; b < B; b++) {
-                            float *st = pstates + (size_t)b * stn;
-                            if (ds4f_attn_qwen_step(&cfg, &tl, L, tr, st,
-                                                    &kvc, c0 + b) != 0)
-                                return 2;
+                        for (int b = 0; b < B; b++) ps_arr[b] = pstates +
+                            (size_t)b * stn;
+                        if (ds4f_attn_gqa_chunk(&cfg, &tl, L, tr, ps_arr,
+                                           c0, B, &kvc) != 0) {
+                            /* fallback: serial per token */
+                            for (int b = 0; b < B; b++) {
+                                float *st = pstates + (size_t)b * stn;
+                                if (ds4f_attn_qwen_step(&cfg, &tl, L, tr, st,
+                                                        &kvc, c0 + b) != 0)
+                                    return 2;
+                            }
                         }
                         if (getenv("DS4F_NAN_PROBE") && L == 3) {
                             double sm = 0.0;
