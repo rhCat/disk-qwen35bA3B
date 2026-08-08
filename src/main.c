@@ -561,6 +561,175 @@ int main(int argc, char **argv) {
     }
 
     double t0 = now_s();
+    /* ---- CHUNKED PREFILL (M1 of prefill-batch, opt-in) ------------
+     * DS4F_PREFILL_CHUNK=1: process the prompt layer-major in chunks
+     * of B tokens. The qkv+z projections batch across the chunk (the
+     * dequant amortizes); the conv ring + delta state stay serial in
+     * token order via lin_body. The trunk is bound ONCE per layer per
+     * chunk (vs once per token), so the layer weights amortize Bx.
+     * The head is skipped for prompt tokens (logits are never sampled
+     * there -- generation re-embeds from last_tok). Bit-identical KV
+     * cache fill vs the serial path. */
+    const char *pc = getenv("DS4F_PREFILL_CHUNK");
+    if (pc && *pc == '1' && text_mode && npids > 1 && moe_mode) {
+        int CHUNK = 64;
+        const char *ce = getenv("DS4F_PREFILL_B");
+        if (ce) {
+            int v = atoi(ce);
+            if (v >= 1 && v <= 512) CHUNK = v;
+        }
+        fprintf(stderr, "[prefill] chunked prompt pass, B=%d npids=%d\n",
+                CHUNK, npids);
+        for (int c0 = 0; c0 < npids; c0 += CHUNK) {
+            int B = (c0 + CHUNK < npids) ? CHUNK : npids - c0;
+            /* per-token states: [B][H * mhc_streams] */
+            long stn = (long)cfg.hidden * mhc_streams;
+            float *pstates = (float *)malloc((size_t)B * (size_t)stn *
+                                             sizeof(float));
+            
+            float *xin_b = (float *)malloc((size_t)cfg.hidden *
+                                           sizeof(float));
+            /* batched gate scores: [B][n_experts] */
+            float *scores_b = (float *)malloc(
+                (size_t)B * (size_t)cfg.n_experts * sizeof(float));
+            float *ps_arr[512];
+            if (!pstates || !xin_b || !scores_b) {
+                fprintf(stderr, "prefill chunk alloc failed\n");
+                return 2;
+            }
+            for (int b = 0; b < B; b++) {
+                ds4f_embed_gather(&embed, pids[c0 + b],
+                                  pstates + (size_t)b * stn);
+                for (int j = 1; j < mhc_streams; j++)
+                    memcpy(pstates + (size_t)b * stn + (size_t)j * cfg.hidden,
+                           pstates + (size_t)b * stn,
+                           (size_t)cfg.hidden * sizeof(float));
+            }
+            /* layer-major: one trunk pass per chunk */
+            ds4f_trunk_rewind(&trunk);
+            for (int L = 0; L < cfg.n_layers; L++) {
+                const uint8_t *tr = ds4f_trunk_bind(&trunk, L);
+                if (!tr) { fprintf(stderr, "trunk bind failed at L%d\n", L); return 2; }
+                int use_real = tl.gate[L] >= 0;
+                /* attention: linear layers batched, gqa serial */
+                if (use_real && kv_ok && !getenv("DS4F_SKIP_ATTN")) {
+                    int q3_layer = (tl.q3_q[L] >= 0) || (tl.q3_conv[L] >= 0);
+                    if (q3_layer && tl.q3_conv[L] >= 0) {
+                        /* batch the linear layer over the chunk */
+                        for (int b = 0; b < B; b++) ps_arr[b] = pstates +
+                            (size_t)b * stn;
+                        if (ds4f_attn_linear_chunk(&cfg, &tl, L, tr, ps_arr,
+                                              c0, B, &kvc) != 0) {
+                            fprintf(stderr, "linear_step_chunk failed at L%d\n", L);
+                            return 2;
+                        }
+                    } else if (q3_layer) {
+                        for (int b = 0; b < B; b++) {
+                            float *st = pstates + (size_t)b * stn;
+                            if (ds4f_attn_qwen_step(&cfg, &tl, L, tr, st,
+                                                    &kvc, c0 + b) != 0)
+                                return 2;
+                        }
+                    } else {
+                        for (int b = 0; b < B; b++) {
+                            float *st = pstates + (size_t)b * stn;
+                            if (ds4f_attn_step(&cfg, &tl, L, tr, st,
+                                               &kvc, c0 + b) != 0)
+                                return 2;
+                        }
+                    }
+                }
+                /* M2 batched rfm measured SLOWER than serial at B=64
+                 * (249-330ms/layer vs 134-167ms: routing diversity
+                 * gives ~2-4 tokens/expert, so the dequant savings
+                 * lose to the gather + spawn overhead). Reverted to
+                 * the per-token loop; ds4f_moe_step_batch stays as a
+                 * -1-fallback for future larger-B work. */
+                double _tf0 = now_s();
+                for (int b = 0; b < B; b++) {
+                    float *st = pstates + (size_t)b * stn;
+                    if (use_real) {
+                        const Ds4fTrunkTensor *gt = &tl.t[tl.gate[L]];
+                        const float *gbias = NULL;
+                        if (tl.gate_bias[L] >= 0) {
+                            const Ds4fTrunkTensor *bt = &tl.t[tl.gate_bias[L]];
+                            gbias = (const float *)(const void *)(tr + bt->off);
+                        }
+                        const float *rstate = st;
+                        if (tl.ffn_norm[L] >= 0 && !getenv("DS4F_NO_NORMS")) {
+                            memcpy(xin_b, st, (size_t)cfg.hidden * sizeof(float));
+                            double sn = 0.0;
+                            for (int i = 0; i < cfg.hidden; i++)
+                                sn += (double)xin_b[i] * xin_b[i];
+                            float rn = sqrtf((float)(sn / (double)cfg.hidden) + 1e-6f);
+                            const uint16_t *pnw = (const uint16_t *)(const void *)(
+                                tr + tl.t[tl.ffn_norm[L]].off);
+                            for (int i = 0; i < cfg.hidden; i++) {
+                                uint32_t pb2 = (uint32_t)pnw[i] << 16;
+                                float pw;
+                                memcpy(&pw, &pb2, 4);
+                                xin_b[i] = xin_b[i] / rn * pw;
+                            }
+                            rstate = xin_b;
+                        }
+                        if (gt->dtype == 5) {
+                            const Ds4fTrunkTensor *gsc = NULL, *gbs = NULL;
+                            for (int qi = tl.t_off[L]; qi < tl.t_off[L + 1]; qi++) {
+                                if (name_ends(tl.t[qi].name, ".mlp.gate.scales"))
+                                    gsc = &tl.t[qi];
+                                else if (name_ends(tl.t[qi].name, ".mlp.gate.biases"))
+                                    gbs = &tl.t[qi];
+                            }
+                            long pcp = gt->dims[1];
+                            ds4f_mlx4_matvec(
+                                (const uint32_t *)(const void *)(tr + gt->off),
+                                gsc ? (const uint16_t *)(const void *)(tr + gsc->off) : NULL,
+                                gbs ? (const uint16_t *)(const void *)(tr + gbs->off) : NULL,
+                                (int)gt->dims[0], (int)(pcp * 8), rstate, scores_b);
+                        } else if (gt->dtype == 4)
+                            ds4f_bf16_matvec(
+                                (const uint16_t *)(const void *)(tr + gt->off),
+                                cfg.n_experts, cfg.hidden, rstate, gbias, scores_b);
+                        else
+                            ds4f_router_scores(
+                                (const float *)(const void *)(tr + gt->off), gbias,
+                                cfg.n_experts, cfg.hidden, rstate, scores_b);
+                        ds4f_topk(scores_b, cfg.n_experts, cfg.topk, idx, w);
+                    } else {
+                        uint64_t hstate = ds4f_mix64(0);
+                        hstate = ds4f_mix64(hstate ^ ds4f_checksum(tr, trunk.lay[L].nbytes));
+                        ds4f_router(idx, w, &cfg, hstate, L, locality);
+                    }
+                    int slots_b[64];
+                    memset(slots_b, 0, sizeof slots_b);
+                    ds4f_cache_getmany(&cache, L, idx, cfg.topk, slots_b);
+                    if (use_real) {
+                        for (int j = 0; j < cfg.topk; j++)
+                            es[j] = ds4f_cache_slot(&cache, slots_b[j]);
+                        if (ds4f_moe_step(&cfg, &tl, L, tr, &pl, es, idx, w,
+                                          st, scratch, scratch_n, jscratch,
+                                          &n_matvec, &n_decode) != 0) {
+                            fprintf(stderr, "moe step failed at L%d\n", L);
+                            return 2;
+                        }
+                    }
+                }
+                if (getenv("DS4F_CHUNK_MS"))
+                    fprintf(stderr, "[chunk-moe] L%d B=%d rfm %.2f ms\n", L, B,
+                            (now_s() - _tf0) * 1e3);
+            }
+            free(pstates); free(xin_b); free(scores_b);
+            if (mem_limit_gb > 0.0) {
+                double rss_gb = (double)ds4f_peak_rss() / 1e9;
+                if (rss_gb >= mem_limit_gb) {
+                    fprintf(stderr, "\nMEMORY LIMIT %.2f GB at chunk %d\n",
+                            rss_gb, c0 / CHUNK);
+                    return 3;
+                }
+            }
+        }
+        fprintf(stderr, "[prefill] chunked pass done, starting gen\n");
+    }
     /* prompt pass + generation: the first npids iterations feed the
      * prompt tokens (no sampling, no output) so the KV/state caches
      * see the whole context; the next gen iterations generate. */
