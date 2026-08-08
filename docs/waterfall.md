@@ -145,7 +145,14 @@ bit-identical against the ENGINE matvec (`tests/verify_batch2.c`).
 | 200 tok | 31.7s | 24.7s | −22% | 8/8 |
 | 500 tok | 83.3s | 62.4s | −25% | 8/8 |
 | 1500 tok | 255.2s | 199.8s | −22% | 8/8 |
-| 3000 tok | (see run) | (see run) | — | — |
+| 3000 tok | 575.5s | 444.7s | −23% | 8/8 |
+| **4096 tok (target)** | **864.6s** | **612.2s** | **−29%** | **8/8** |
+
+The 4096-tier pressure test (the target context level) is the strongest
+result: 14.4 min serial → 10.2 min chunked, −29%, bit-identical
+generation (8/8 top1, byte-identical response). The speedup grows with
+context — the batched projections amortize better over longer prompts.
+Per-token: 0.21 s/tok serial → 0.15 s/tok chunked at 4096.
 
 Bugs found & fixed during the work (all documented in commit bodies):
 absolute MLX4 group indexing in the batch kernel; double prompt
