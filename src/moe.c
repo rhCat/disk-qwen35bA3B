@@ -1292,7 +1292,7 @@ gpu_combined:
         }
     }
 
-    if (getenv("DS4F_NAN_PROBE") && L < 3) {
+    if (getenv("DS4F_NAN_PROBE") && L < 5) {
         double a2 = 0.0, i2 = 0.0;
         for (int i = 0; i < H; i++) {
             a2 += (double)acc[i] * acc[i];

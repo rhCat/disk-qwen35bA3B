@@ -636,6 +636,14 @@ int main(int argc, char **argv) {
                                                     &kvc, c0 + b) != 0)
                                 return 2;
                         }
+                        if (getenv("DS4F_NAN_PROBE") && L == 3) {
+                            double sm = 0.0;
+                            for (int i = 0; i < cfg.hidden; i++)
+                                sm += (double)pstates[8 * stn + i] *
+                                      pstates[8 * stn + i];
+                            fprintf(stderr, "[chk-gqa] L3 t8 post-gqa rms "
+                                    "%.6g\n", sqrt(sm / cfg.hidden));
+                        }
                         _tgqa += now_s() - _tg0;
                     } else {
                         for (int b = 0; b < B; b++) {
@@ -726,6 +734,33 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[chunk-moe] L%d B=%d rfm %.2f ms\n", L, B,
                             (now_s() - _tf0) * 1e3);
                     _trfm += now_s() - _tf0;
+                }
+                /* NAN_PROBE state dump at token 8 (matches the serial
+                 * path's /tmp/q35-eng-L%d-t8.bin) so the chunk fill
+                 * can be diffed layer by layer vs the serial fill. */
+                if (getenv("DS4F_NAN_PROBE") && c0 <= 8 && c0 + B > 8) {
+                    int tb = 8 - c0;
+                    char pth[128];
+                    snprintf(pth, sizeof pth, "/tmp/q35-eng-L%d-t8.bin", L);
+                    FILE *sf = fopen(pth, "wb");
+                    if (sf) {
+                        fwrite(pstates + (size_t)tb * stn, sizeof(float),
+                               (size_t)cfg.hidden, sf);
+                        fclose(sf);
+                    }
+                }
+                /* all tokens at L<4 (the GQA coupling at L3 reads the
+                 * past tokens' K cache -- need per-token diffs) */
+                if (getenv("DS4F_NAN_PROBE") && L < 4) {
+                    char pth[128];
+                    snprintf(pth, sizeof pth, "/tmp/q35-eng-L%d-t%d.bin",
+                             L, c0);
+                    FILE *sf = fopen(pth, "wb");
+                    if (sf) {
+                        fwrite(pstates, sizeof(float),
+                               (size_t)B * stn, sf);
+                        fclose(sf);
+                    }
                 }
             }
             if (getenv("DS4F_CHUNK_MS"))
@@ -1126,9 +1161,19 @@ int main(int argc, char **argv) {
                     if (state[i] != state[i]) { bad = 1; break; }
                 if (bad)
                     fprintf(stderr, "[nan] t%d after L%d\n", t, L);
-                if (t == 8 && L % 4 == 0) {
+                if (t == 8) {
                     char pth[128];
                     snprintf(pth, sizeof pth, "/tmp/q35-eng-L%d-t8.bin", L);
+                    FILE *sf = fopen(pth, "wb");
+                    if (sf) {
+                        fwrite(state, sizeof(float), (size_t)cfg.hidden, sf);
+                        fclose(sf);
+                    }
+                }
+                if (L < 4) {
+                    char pth[128];
+                    snprintf(pth, sizeof pth, "/tmp/q35-eng-L%d-t%d.bin",
+                             L, t);
                     FILE *sf = fopen(pth, "wb");
                     if (sf) {
                         fwrite(state, sizeof(float), (size_t)cfg.hidden, sf);

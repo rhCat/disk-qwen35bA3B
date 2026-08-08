@@ -917,6 +917,15 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             fprintf(stderr, "[proj] L%d qkv+z: %.2f ms (avg %.2f)\n",
                     L, (now_s() - _tproj) * 1e3, _pacc / _pcnt * 1e3);
     }
+    if (getenv("DS4F_PROJ_MS") && L == 3 && token == 8) {
+        fprintf(stderr, "[qkvd] serial dump L3 t8 firing\n");
+        FILE *pf = fopen("/tmp/qkv-serial-L3.bin", "wb");
+        if (pf) {
+            fwrite(qkv, sizeof(float), (size_t)qkv_rows, pf);
+            fwrite(z, sizeof(float), (size_t)z_rows, pf);
+            fclose(pf);
+        }
+    }
     return lin_body(cfg, tl, L, tr, kv, token, state, qkv, z, buf);
 
     return 0;
@@ -969,6 +978,12 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
                  (long)v_heads * 128 + 2 * H + 1;
     float *bbuf = (float *)malloc((size_t)bneed * sizeof(float));
     if (!xs || !bbuf) { free(xs); free(bbuf); return -1; }
+    /* zero the WHOLE body buffer like the serial path's
+     * memset(buf, 0, ...): lin_body reads regions it did not write
+     * (the o/readout/qk slack), and garbage there is a structural
+     * divergence -- the chunk fill diverged from serial at L3 for
+     * exactly this reason (2048/2048 state floats differed). */
+    memset(bbuf, 0, (size_t)bneed * sizeof(float));
 
     /* 1) per-token input_layernorm into xins[B][H] (row-major) */
     if (iln >= 0) {
@@ -1008,6 +1023,17 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
             z_rows, cols, B, xins, zbtok) != 0) {
         free(xs); free(bbuf);
         return -1;                 /* caller falls back to serial */
+    }
+    if (getenv("DS4F_PROJ_MS") && L == 3 && t0 <= 8 && t0 + B > 8) {
+        int tb = 8 - t0;
+        float *qkv = qkvs + (size_t)tb * qkv_rows;
+        float *z = zbtok + (size_t)tb * z_rows;
+        FILE *pf = fopen("/tmp/qkv-chunk-L3.bin", "wb");
+        if (pf) {
+            fwrite(qkv, sizeof(float), (size_t)qkv_rows, pf);
+            fwrite(z, sizeof(float), (size_t)z_rows, pf);
+            fclose(pf);
+        }
     }
 
     /* 3) serial per-token body: conv ring + delta state in token order */
