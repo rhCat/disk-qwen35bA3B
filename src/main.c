@@ -1231,6 +1231,11 @@ int main(int argc, char **argv) {
         double wf_sum = wf_attn + wf_route + wf_fetch + wf_moe + wf_head;
         wf_misc = dt - wf_sum;
         if (wf_misc < 0) wf_misc = 0;
+        /* NOTE: the timers span the WHOLE run (prompt pass + gen), so
+         * per-token is over total_toks, NOT gen -- gen alone inflated
+         * every phase ~376x on long-context runs and broke the
+         * sum-to-total check. */
+        int wt = total_toks > 0 ? total_toks : gen;
         fprintf(stderr,
                 "\n--- waterfall (total %.1f s over %d tokens, %.1f ms/token) ---\n"
                 "attn:   %6.1f ms/token (%4.1f%%)\n"
@@ -1239,13 +1244,13 @@ int main(int argc, char **argv) {
                 "moe:    %6.1f ms/token (%4.1f%%)\n"
                 "head:   %6.1f ms/token (%4.1f%%)\n"
                 "misc:   %6.1f ms/token (%4.1f%%)\n",
-                dt, gen, dt / (double)gen * 1e3,
-                wf_attn / gen * 1e3, wf_attn / dt * 100.0,
-                wf_route / gen * 1e3, wf_route / dt * 100.0,
-                wf_fetch / gen * 1e3, wf_fetch / dt * 100.0,
-                wf_moe / gen * 1e3, wf_moe / dt * 100.0,
-                wf_head / gen * 1e3, wf_head / dt * 100.0,
-                wf_misc / gen * 1e3, wf_misc / dt * 100.0);
+                dt, wt, dt / (double)wt * 1e3,
+                wf_attn / wt * 1e3, wf_attn / dt * 100.0,
+                wf_route / wt * 1e3, wf_route / dt * 100.0,
+                wf_fetch / wt * 1e3, wf_fetch / dt * 100.0,
+                wf_moe / wt * 1e3, wf_moe / dt * 100.0,
+                wf_head / wt * 1e3, wf_head / dt * 100.0,
+                wf_misc / wt * 1e3, wf_misc / dt * 100.0);
     }
 
     int rc = 0;
