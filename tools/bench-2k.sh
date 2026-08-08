@@ -6,7 +6,7 @@ REPO=/Users/ruihe/disk-qwen35bA3B
 cd "$REPO"
 unset PYTHONPATH
 export PATH="/Volumes/prod/miniforge3/envs/ca_lpp/bin:$PATH"
-export DS4F_GREEDY=1 DS4F_REP_PENALTY=1.3
+export DS4F_GREEDY=1 DS4F_REP_PENALTY=1.3 DS4F_WATERFALL=1
 for GEN in 1 8; do
   t0=$("$REPO/.venv/bin/python3" -c 'import time; print(time.time())')
   bash tools/run-clean.sh ./ds4f /tmp/q35-trunk \
@@ -22,4 +22,6 @@ for GEN in 1 8; do
   t1=$("$REPO/.venv/bin/python3" -c 'import time; print(time.time())')
   echo "GEN=$GEN EXIT $rc | wall $("$REPO/.venv/bin/python3" -c "import time;print(f'{$t1-$t0:.1f}s')")"
   grep -E 'tokens in|GB read|PEAK' /tmp/bench-2k-gen$GEN.log | head -3
+  echo "--- waterfall GEN=$GEN ---"
+  grep -E 'attn:|router:|fetch:|moe:    |head:|misc:|waterfall' /tmp/bench-2k-gen$GEN.log | head -8
 done

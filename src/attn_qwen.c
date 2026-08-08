@@ -24,6 +24,10 @@
 #include "ds4f/kernels.h"
 #include "ds4f/moe.h"
 
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -587,6 +591,87 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         if (L % 8 == 0 && token == 6)
             fprintf(stderr, "[lin] L%d pre-state rms %.6g\n", L, sqrt(sm));
     }
+    if (ds4f_kernels_simd() && kd % 4 == 0 && vd % 4 == 0) {
+        /* NEON delta rule: 4-wide over vd. Each output element keeps
+         * the SAME i-accumulation order as the scalar loop, and the
+         * vmlaq FMA matches -O2 fp-contract=on, so results are
+         * bit-identical to the scalar path -- verified by e2e. */
+        for (int h = 0; h < v_heads; h++) {
+            int khh = h / 2;
+            const float *kh = qkv + (size_t)(k_heads * kd) + (size_t)khh * kd;
+            const float *qh = qkv + (size_t)khh * kd;
+            const float *vh = qkv + (size_t)(2 * k_heads * kd) +
+                              (size_t)h * vd;
+            float *Sh = S + (size_t)h * kd * vd;
+            float beta = 1.0f / (1.0f + expf(-b32[h]));
+            float decay = expf(g32[h]);
+            float32x4_t dcy = vdupq_n_f32(decay);
+            /* state *= decay (elementwise, 4-wide) */
+            for (int i = 0; i < kd * vd; i += 4) {
+                float32x4_t s = vld1q_f32(Sh + i);
+                vst1q_f32(Sh + i, vmulq_f32(s, dcy));
+            }
+            /* kv_mem = sum_k(state * k) -> [vd]; delta = (v - kv_mem)*beta */
+            float delta[128];
+            for (int j = 0; j < vd; j += 4) {
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (int i = 0; i < kd; i++) {
+                    float32x4_t s = vld1q_f32(Sh + (size_t)i * vd + j);
+                    acc = vmlaq_f32(acc, s, vdupq_n_f32(kh[i]));
+                }
+                float32x4_t vv = vld1q_f32(vh + j);
+                float32x4_t dl = vmulq_f32(vsubq_f32(vv, acc),
+                                           vdupq_n_f32(beta));
+                vst1q_f32(delta + j, dl);
+            }
+            /* state += k (x) delta (row-wise, 4-wide) */
+            for (int i = 0; i < kd; i++) {
+                float32x4_t kk = vdupq_n_f32(kh[i]);
+                float *row = Sh + (size_t)i * vd;
+                for (int j = 0; j < vd; j += 4) {
+                    float32x4_t s = vld1q_f32(row + j);
+                    float32x4_t d = vld1q_f32(delta + j);
+                    vst1q_f32(row + j, vmlaq_f32(s, kk, d));
+                }
+            }
+            /* readout: out_h = sum_k(state * q) */
+            float *oh = readout + (size_t)h * vd;
+            for (int j = 0; j < vd; j += 4) {
+                float32x4_t acc = vdupq_n_f32(0.0f);
+                for (int i = 0; i < kd; i++) {
+                    float32x4_t s = vld1q_f32(Sh + (size_t)i * vd + j);
+                    acc = vmlaq_f32(acc, s, vdupq_n_f32(qh[i]));
+                }
+                vst1q_f32(oh + j, acc);
+            }
+            if (getenv("DS4F_NAN_PROBE") && L == 0 && token == 8 && h == 0) {
+                double sm = 0.0;
+                for (int i = 0; i < kd * vd; i++)
+                    if (Sh[i] == Sh[i]) sm += (double)Sh[i] * Sh[i];
+                double k2 = 0.0, v2 = 0.0, d2 = 0.0, q2 = 0.0;
+                for (int i = 0; i < kd; i++) {
+                    k2 += (double)kh[i] * kh[i];
+                    q2 += (double)qh[i] * qh[i];
+                }
+                for (int i = 0; i < vd; i++) v2 += (double)vh[i] * vh[i];
+                for (int i = 0; i < vd; i++) d2 += (double)delta[i] * delta[i];
+                fprintf(stderr, "[delta] L%d h0 decay %.6g beta %.6g k-rms %.6g "
+                        "q-rms %.6g v-rms %.6g delta-rms %.6g state-rms %.6g\n",
+                        L, decay, beta, sqrt(k2 / kd), sqrt(q2 / kd),
+                        sqrt(v2 / vd), sqrt(d2 / vd), sqrt(sm / (kd * vd)));
+                FILE *vf = fopen("/tmp/q35-eng-L0-k.bin", "wb");
+                if (vf) { fwrite(kh, sizeof(float), (size_t)kd, vf); fclose(vf); }
+                vf = fopen("/tmp/q35-eng-L0-q.bin", "wb");
+                if (vf) { fwrite(qh, sizeof(float), (size_t)kd, vf); fclose(vf); }
+                vf = fopen("/tmp/q35-eng-L0-v.bin", "wb");
+                if (vf) { fwrite(vh, sizeof(float), (size_t)vd, vf); fclose(vf); }
+                vf = fopen("/tmp/q35-eng-L0-delta.bin", "wb");
+                if (vf) { fwrite(delta, sizeof(float), (size_t)vd, vf); fclose(vf); }
+                vf = fopen("/tmp/q35-eng-L0-S.bin", "wb");
+                if (vf) { fwrite(Sh, sizeof(float), (size_t)kd * vd, vf); fclose(vf); }
+            }
+        }
+    } else {
     for (int h = 0; h < v_heads; h++) {
         int khh = h / 2;
         const float *kh = qkv + (size_t)(k_heads * kd) + (size_t)khh * kd;
@@ -647,6 +732,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             vf = fopen("/tmp/q35-eng-L0-S.bin", "wb");
             if (vf) { fwrite(Sh, sizeof(float), (size_t)kd * vd, vf); fclose(vf); }
         }
+    }
     }
     /* RMSNormGated: norm.weight * out * silu(z) -- the learned norm is
      * on the OUTPUT, gated by silu(z). The norm is PER-HEAD (each

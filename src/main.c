@@ -250,6 +250,12 @@ int main(int argc, char **argv) {
     float **jscratch = NULL;
     long scratch_n = 0;
     int64_t n_matvec = 0, n_decode = 0;
+    /* DS4F_WATERFALL: per-phase accumulators (seconds) across the
+     * whole decode loop -- attn, router, expert fetch, moe, head,
+     * misc. Printed after the run report. */
+    double wf_attn = 0, wf_route = 0, wf_fetch = 0, wf_moe = 0,
+           wf_head = 0, wf_misc = 0;
+    int wf_on = getenv("DS4F_WATERFALL") ? 1 : 0;
     if (tl_path && pl_path) {
         fprintf(stderr, "moe: loading trunk layout %s\n", tl_path);
         if (ds4f_trunk_layout_load(&tl, tl_path) != 0) return 1;
@@ -658,11 +664,13 @@ int main(int argc, char **argv) {
             if (use_real && kv_ok && !getenv("DS4F_SKIP_ATTN")) {
                 int q3_layer = (tl.q3_q[L] >= 0) || (tl.q3_conv[L] >= 0);
                 int rc;
+                double _ta = now_s();
                 if (q3_layer)
                     rc = ds4f_attn_qwen_step(&cfg, &tl, L, tr, state,
                                              &kvc, t);
                 else
                     rc = ds4f_attn_step(&cfg, &tl, L, tr, state, &kvc, t);
+                if (wf_on) wf_attn += now_s() - _ta;
                 if (rc != 0) {
                     fprintf(stderr, "attn step failed at layer %d\n", L);
                     return 2;
@@ -713,6 +721,7 @@ int main(int argc, char **argv) {
                        state, (size_t)cfg.hidden * mhc_streams *
                        sizeof(float));
             }
+            double _tr = now_s();
             if (use_real) {
                 const Ds4fTrunkTensor *gt = &tl.t[tl.gate[L]];
                 const float *gbias = NULL;
@@ -832,17 +841,22 @@ int main(int argc, char **argv) {
                     hstate ^ ds4f_checksum(tr, trunk.lay[L].nbytes));
                 ds4f_router(idx, w, &cfg, hstate, L, locality);
             }
+            if (wf_on) wf_route += now_s() - _tr;
 
+            double _tf = now_s();
             ds4f_cache_getmany(&cache, L, idx, cfg.topk, slots);
+            if (wf_on) wf_fetch += now_s() - _tf;
             if (use_real) {
                 for (int j = 0; j < cfg.topk; j++)
                     es[j] = ds4f_cache_slot(&cache, slots[j]);
+                double _tm = now_s();
                 if (ds4f_moe_step(&cfg, &tl, L, tr, &pl, es, idx, w,
                                   state, scratch, scratch_n, jscratch,
                                   &n_matvec, &n_decode) != 0) {
                     fprintf(stderr, "moe step failed at layer %d\n", L);
                     return 2;
                 }
+                if (wf_on) wf_moe += now_s() - _tm;
                 if (getenv("DS4F_DEBUG6")) {
                     double s2 = 0.0;
                     long n = (long)cfg.hidden * mhc_streams;
@@ -1037,10 +1051,12 @@ int main(int argc, char **argv) {
                     hstate_in = xin_buf;
                 }
             }
+            double _th = now_s();
             if (ds4f_head_logits(&head, hstate_in, logits) != 0) {
                 fprintf(stderr, "head logits failed\n");
                 return 2;
             }
+            if (wf_on) wf_head += now_s() - _th;
             if (getenv("DS4F_DEBUG7")) {
                 /* the logits shape: peaked vs flat, and the top-5 ids
                  * + their decoded tokens (the soup diagnosis) */
@@ -1210,6 +1226,27 @@ int main(int argc, char **argv) {
             moe_mode ? "moe: real matvec compute (kernels)\n" : "",
             ds4f_kernels_simd() ? "kernels: simd\n" : "kernels: scalar\n",
             (double)ds4f_peak_rss() / 1e9);
+
+    if (wf_on) {
+        double wf_sum = wf_attn + wf_route + wf_fetch + wf_moe + wf_head;
+        wf_misc = dt - wf_sum;
+        if (wf_misc < 0) wf_misc = 0;
+        fprintf(stderr,
+                "\n--- waterfall (total %.1f s over %d tokens, %.1f ms/token) ---\n"
+                "attn:   %6.1f ms/token (%4.1f%%)\n"
+                "router: %6.1f ms/token (%4.1f%%)\n"
+                "fetch:  %6.1f ms/token (%4.1f%%)\n"
+                "moe:    %6.1f ms/token (%4.1f%%)\n"
+                "head:   %6.1f ms/token (%4.1f%%)\n"
+                "misc:   %6.1f ms/token (%4.1f%%)\n",
+                dt, gen, dt / (double)gen * 1e3,
+                wf_attn / gen * 1e3, wf_attn / dt * 100.0,
+                wf_route / gen * 1e3, wf_route / dt * 100.0,
+                wf_fetch / gen * 1e3, wf_fetch / dt * 100.0,
+                wf_moe / gen * 1e3, wf_moe / dt * 100.0,
+                wf_head / gen * 1e3, wf_head / dt * 100.0,
+                wf_misc / gen * 1e3, wf_misc / dt * 100.0);
+    }
 
     int rc = 0;
     if (cache.ndrop > 0) {
