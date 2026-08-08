@@ -430,6 +430,7 @@ static int lin_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         float tmp[32];
         if (mlx4_proj(tl, ai, as_, ab, tr, 32, cols, xin, tmp) != 0 ||
             mlx4_proj(tl, bi, bs_, bb, tr, 32, cols, xin, a32) != 0) {
+            fprintf(stderr, "[linbody] L%d a/b proj FAIL ai=%d bi=%d cols=%d\n", L, ai, bi, cols);
             return -1;
         }
         memcpy(b32, a32, sizeof b32);        /* b = second proj result */
@@ -735,6 +736,7 @@ static int lin_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     if (getenv("DS4F_PROJ_MS")) _to = now_s();
     if (mlx4_proj(tl, oi, os_, ob, tr, o_rows, v_heads * vd, readout, o)
         != 0) {
+        fprintf(stderr, "[linbody] L%d o proj FAIL oi=%d os_=%d\n", L, oi, os_);
         return -1;
     }
     if (getenv("DS4F_PROJ_MS")) {
@@ -793,6 +795,7 @@ static int lin_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 xin[0], xin[1], xin[2], xin[3]);
     }
     for (int i = 0; i < H; i++) state[i] += o[i];
+    return 0;
 }
 
 static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
@@ -841,10 +844,18 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     if (getenv("DS4F_NAN_PROBE") && L < 3)
         fprintf(stderr, "[lin] L%d enter ok\n", L);
     if (!kv || token < 0 || token >= kv->max_tokens) return 0;
-    if (!kv->lin_alloc)
-        if (ds4f_kv_lin_init(kv, v_heads, kd, vd) != 0) return -1;
-    if (!kv->conv_alloc)
-        if (ds4f_kv_conv_init(kv, qkv_rows) != 0) return -1;
+    if (!kv->lin_alloc) {
+        if (ds4f_kv_lin_init(kv, v_heads, kd, vd) != 0) {
+            fprintf(stderr, "[lin] L%d kv_lin_init FAILED vh=%d kd=%d vd=%d\n", L, v_heads, kd, vd);
+            return -1;
+        }
+    }
+    if (!kv->conv_alloc) {
+        if (ds4f_kv_conv_init(kv, qkv_rows) != 0) {
+            fprintf(stderr, "[lin] L%d kv_conv_init FAILED qkv_rows=%d\n", L, qkv_rows);
+            return -1;
+        }
+    }
     /* the conv1d ring lives in the kv cache: it must survive across
      * tokens (the causal conv reads the PREVIOUS qkv vectors) */
     float *conv_ring = kv->conv + (size_t)L * 4 * qkv_rows;
@@ -892,8 +903,10 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             zb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[zb].off)
                     : NULL, z_rows,
             cols, xin, qkv, z) != 0) {
+        fprintf(stderr, "[lin] L%d matvec2 FAILED, fallback\n", L);
         if (mlx4_proj(tl, pi, ps, pb, tr, qkv_rows, cols, xin, qkv) != 0 ||
             mlx4_proj(tl, zi, zs, zb, tr, z_rows, cols, xin, z) != 0) {
+            fprintf(stderr, "[lin] L%d fallback proj FAILED pi=%d zi=%d cols=%d\n", L, pi, zi, cols);
             return -1;
         }
     }
@@ -916,7 +929,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
  * state) runs per token via lin_body, in token order, so results are
  * bit-identical to B sequential linear_step calls. states[B][H] in,
  * residual-added out. Returns 0 ok, -1 fail (caller falls back). */
-static int linear_step_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
+int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
                              int L, const uint8_t *tr,
                              float *const *states, int t0, int B,
                              Ds4fKvCache *kv) {
