@@ -1004,22 +1004,32 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     }
     float rms_in = sqrtf((float)(ss_in / (double)H));
 
-    float *latent = (float *)calloc((size_t)D, sizeof(float));
-    float *cur    = (float *)calloc((size_t)D, sizeof(float));
-    float *out    = (float *)calloc((size_t)D, sizeof(float));
-    float *acc    = (float *)calloc((size_t)D, sizeof(float));
-    /* per-job work buffers (out + cur/tmp/chain), allocated once per
-     * call in ONE block -- never malloc per fetch (exp_run). Per job:
-     * out (Lat floats) + cur/tmp/chain (3 x D floats). */
+    /* Persistent per-call scratch matrix: latent/cur/out/acc (D each)
+     * + jobbuf (maxjob x perjob) were calloc'd and freed 40x/token --
+     * ~288KB x 40 layers x tokens of allocator churn. Now ONE
+     * thread-local block, grown on demand, reused across calls (the
+     * caller's warm scratch already follows this pattern). The
+     * zero-init is preserved: calloc on first touch, memset reuse. */
     int maxjob = cfg->topk > 64 ? 64 : cfg->topk;
     if (maxjob < 1) maxjob = 1;
     long perjob = (long)Lat + 3L * D;
-    float *jobbuf = (float *)calloc((size_t)maxjob * (size_t)perjob,
-                                    sizeof(float));
-    if (!latent || !cur || !out || !acc || !jobbuf) {
-        free(latent); free(cur); free(out); free(acc); free(jobbuf);
-        return -1;
+    size_t need = (size_t)(4 * D + maxjob * perjob) * sizeof(float);
+    static __thread float *tl_moe = NULL;
+    static __thread size_t tl_moe_cap = 0;
+    if (need > tl_moe_cap) {
+        float *nb = (float *)realloc(tl_moe, need);
+        if (!nb) return -1;
+        tl_moe = nb;
+        tl_moe_cap = need;
+        memset(tl_moe, 0, need);       /* keep the calloc zero-init */
+    } else {
+        memset(tl_moe, 0, need);
     }
+    float *latent = tl_moe;
+    float *cur    = tl_moe + (size_t)D;
+    float *out    = tl_moe + 2 * (size_t)D;
+    float *acc    = tl_moe + 3 * (size_t)D;
+    float *jobbuf = tl_moe + 4 * (size_t)D;
     (void)cur;              /* expert chains now run in worker threads */
     (void)scratch;          /* job 0 uses the caller's warm buffer */
 
@@ -1166,14 +1176,14 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
          * the caller's pool -- never malloc per call (page faults). */
         jb->scratch = (njob == 0) ? scratch : job_scratch[njob - 1];
         if (!jb->out || !jb->scratch) {
-            free(latent); free(cur); free(out); free(acc); free(jobbuf);
+            /* TLS scratch: process-lifetime, no free */
             return -1;
         }
         jb->Lat = Lat;
         jb->D = D;
         jb->scratch_n = scratch_n;
         if (pthread_create(&th[njob], NULL, exp_run, jb) != 0) {
-            free(latent); free(cur); free(out); free(acc); free(jobbuf);
+            /* TLS scratch: process-lifetime, no free */
             return -1;
         }
         njob++;
@@ -1183,7 +1193,7 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     for (int j = 0; j < njob; j++) {
         ExpJob *jb = &job[j];
         if (jb->fail) {
-            free(latent); free(cur); free(out); free(acc); free(jobbuf);
+            /* TLS scratch: process-lifetime, no free */
             return -1;
         }
         *n_matvec += jb->n_matvec;
@@ -1282,7 +1292,7 @@ gpu_combined:
         }
     }
 
-    if (getenv("DS4F_NAN_PROBE") && L < 3) {
+    if (getenv("DS4F_NAN_PROBE") && L < 5) {
         double a2 = 0.0, i2 = 0.0;
         for (int i = 0; i < H; i++) {
             a2 += (double)acc[i] * acc[i];
@@ -1441,6 +1451,257 @@ gpu_combined:
 
     free(orig);
     free(xin);
-    free(latent); free(cur); free(out); free(acc); free(jobbuf);
+    /* TLS scratch: process-lifetime, no free */
+    return 0;
+}
+
+/* ---- M2: batched moe for the chunked prefill --------------------- */
+/* B tokens, topk selections each. The B*topk (token, expert) pairs
+ * are grouped by expert id; each distinct expert's gate/up/down run
+ * ONCE as a batched matvec over its group (dequant amortized), the
+ * down outputs are stored per selection, then combined in SELECTION
+ * order -- the same combine order as the serial path, so the combine
+ * is bit-identical. xins is [H][B] column-major (the batch kernel
+ * layout, from linear_step_chunk's norm). es is [B][topk] resident
+ * expert slot bytes; sel/wsel [B][topk]. states[B][H] in/out.
+ * Returns -1 if the layer needs a path this batch can't do (mHC),
+ * and the caller falls back to serial moe_step per token. */
+typedef struct {
+    int eid, b, j;
+    float w;
+    const uint8_t *slot;
+} MoeSel;
+
+static int sel_cmp(const void *a, const void *b) {
+    const MoeSel *x = (const MoeSel *)a, *y = (const MoeSel *)b;
+    return x->eid - y->eid;
+}
+
+int ds4f_moe_step_batch(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
+                        const uint8_t *tr, const Ds4fPoolLayout *pl,
+                        const float *xins, int B, int topk,
+                        const int *sel, const float *wsel,
+                        const uint8_t *const *es,
+                        float *const *states,
+                        int64_t *n_matvec, int64_t *n_decode) {
+    int H = cfg->hidden, Lat = cfg->latent, M = cfg->moe_inter;
+    if (B < 1 || topk < 1 || !tl || !pl) return -1;
+    /* mHC layer: fall back to the serial per-token path */
+    if (tl->hc_ffn_fn[L] >= 0) return -1;
+    /* the Qwen3.5 residual is state += acc (no up tensor, no hc) */
+    int ui = tl->up[L];
+    if (ui >= 0) return -1;            /* batched path: identity-up only */
+
+    static __thread float *tb_acc = NULL;    /* [B][H] */
+    static __thread size_t tb_acc_cap = 0;
+    static __thread float *tb_dy = NULL;     /* [B*topk][H] per-selection */
+    static __thread size_t tb_dy_cap = 0;
+    static __thread float *tb_w = NULL;      /* [G][M] gate/up workspace */
+    static __thread size_t tb_w_cap = 0;
+    size_t nacc = (size_t)B * H;
+    size_t ndy = (size_t)B * topk * H;
+    if (nacc > tb_acc_cap) {
+        float *nb = (float *)realloc(tb_acc, nacc * sizeof(float));
+        if (!nb) return -1;
+        tb_acc = nb; tb_acc_cap = nacc;
+    }
+    if (ndy > tb_dy_cap) {
+        float *nb = (float *)realloc(tb_dy, ndy * sizeof(float));
+        if (!nb) return -1;
+        tb_dy = nb; tb_dy_cap = ndy;
+    }
+    memset(tb_acc, 0, nacc * sizeof(float));
+    memset(tb_dy, 0, ndy * sizeof(float));
+
+    MoeSel *sl = (MoeSel *)malloc((size_t)B * topk * sizeof(MoeSel));
+    if (!sl) return -1;
+    int ns = 0;
+    for (int b = 0; b < B; b++)
+        for (int j = 0; j < topk; j++) {
+            int eid = sel[(size_t)b * topk + j];
+            if (eid < 0 || !es[(size_t)b * topk + j]) continue;
+            sl[ns].eid = eid; sl[ns].b = b; sl[ns].j = j;
+            sl[ns].w = wsel[(size_t)b * topk + j];
+            sl[ns].slot = es[(size_t)b * topk + j];
+            ns++;
+        }
+    if (ns > 0) {
+        qsort(sl, (size_t)ns, sizeof(MoeSel), sel_cmp);
+        /* per-selection workspace: [G][M] gate + up + chain */
+        size_t gw = (size_t)ns * M;   /* worst case: all one expert */
+        if (gw > tb_w_cap) {
+            float *nb = (float *)realloc(tb_w, (3 * gw) * sizeof(float));
+            if (!nb) { free(sl); return -1; }
+            tb_w = nb; tb_w_cap = gw;
+        }
+        float *gys = tb_w;
+        float *uys = tb_w + gw;
+        float *cns = tb_w + 2 * gw;
+        /* column-major gathers: xcol[H][G], ccol[M][G] */
+        float *xcol = (float *)malloc((size_t)H * ns * sizeof(float));
+        float *ccol = (float *)malloc((size_t)M * ns * sizeof(float));
+        if (!xcol || !ccol) { free(xcol); free(ccol); free(sl); return -1; }
+        int i0 = 0;
+        while (i0 < ns) {
+            int i1 = i0 + 1;
+            while (i1 < ns && sl[i1].eid == sl[i0].eid) i1++;
+            int G = i1 - i0;
+            const Ds4fExpertLayout *el =
+                &pl->exp[(size_t)L * pl->n_experts + sl[i0].eid];
+            const Ds4fMoETensor *g = &el->t[0], *u = &el->t[1],
+                                *d = &el->t[2];
+            if (g->rank != 2 || u->rank != 2 || d->rank != 2 ||
+                g->rel_v < 0 || g->rel_s < 0 || u->rel_v < 0 ||
+                u->rel_s < 0 || d->rel_v < 0 || d->rel_s < 0) {
+                free(xcol); free(ccol); free(sl); return -1;
+            }
+            /* gather xcol[H][G] from xins[H][B] */
+            for (int gg = 0; gg < G; gg++) {
+                int b = sl[i0 + gg].b;
+                for (int i = 0; i < H; i++)
+                    xcol[(size_t)i * G + gg] = xins[(size_t)i * B + b];
+            }
+            const uint32_t *gv = (const uint32_t *)(const void *)
+                (sl[i0].slot + g->rel_v);
+            const uint16_t *gsc = (const uint16_t *)(const void *)
+                (sl[i0].slot + g->rel_s);
+            const uint16_t *gb = g->rel_b >= 0
+                ? (const uint16_t *)(const void *)(sl[i0].slot + g->rel_b)
+                : NULL;
+            const uint32_t *uv = (const uint32_t *)(const void *)
+                (sl[i0].slot + u->rel_v);
+            const uint16_t *usc = (const uint16_t *)(const void *)
+                (sl[i0].slot + u->rel_s);
+            const uint16_t *ub = u->rel_b >= 0
+                ? (const uint16_t *)(const void *)(sl[i0].slot + u->rel_b)
+                : NULL;
+            float *gy = gys + (size_t)i0 * M;
+            float *uy = uys + (size_t)i0 * M;
+            float *cn = cns + (size_t)i0 * M;
+            if (ds4f_mlx4_matvec_batch(gv, gsc, gb, M, H, G, xcol, gy) != 0 ||
+                ds4f_mlx4_matvec_batch(uv, usc, ub, M, H, G, xcol, uy) != 0) {
+                free(xcol); free(ccol); free(sl); return -1;
+            }
+            for (int gg = 0; gg < G; gg++) {
+                float *cgr = cn + (size_t)gg * M;
+                const float *gyr = gy + (size_t)gg * M;
+                const float *uyr = uy + (size_t)gg * M;
+                for (int i = 0; i < M; i++) {
+                    float s = gyr[i];
+                    float sig = 1.0f / (1.0f + expf(-s));
+                    cgr[i] = s * sig * uyr[i];   /* silu(gate)*up */
+                }
+            }
+            /* ccol[M][G] for the down batch */
+            for (int gg = 0; gg < G; gg++)
+                for (int i = 0; i < M; i++)
+                    ccol[(size_t)i * G + gg] = cns[(size_t)(i0 + gg) * M + i];
+            const uint32_t *dv = (const uint32_t *)(const void *)
+                (sl[i0].slot + d->rel_v);
+            const uint16_t *dsc = (const uint16_t *)(const void *)
+                (sl[i0].slot + d->rel_s);
+            const uint16_t *db = d->rel_b >= 0
+                ? (const uint16_t *)(const void *)(sl[i0].slot + d->rel_b)
+                : NULL;
+            if (ds4f_mlx4_matvec_batch(dv, dsc, db, H, M, G, ccol,
+                                       tb_dy + (size_t)i0 * H) != 0) {
+                free(xcol); free(ccol); free(sl); return -1;
+            }
+            (*n_matvec) += 3 * G;
+            (*n_decode) += (int64_t)G * (M * H + M * H + H * M);
+            i0 = i1;
+        }
+        /* combine in SELECTION order: acc[b] += w[j] * dy[b][j] */
+        for (int b = 0; b < B; b++)
+            for (int j = 0; j < topk; j++) {
+                int eid = sel[(size_t)b * topk + j];
+                if (eid < 0) continue;
+                /* find the selection's dy: linear over the group list */
+                float w = wsel[(size_t)b * topk + j];
+                if (w == 0.0f) continue;
+                for (int s = 0; s < ns; s++)
+                    if (sl[s].b == b && sl[s].j == j) {
+                        const float *dy = tb_dy + (size_t)s * H;
+                        float *ac = tb_acc + (size_t)b * H;
+                        for (int i = 0; i < H; i++)
+                            ac[i] += w * dy[i];
+                        break;
+                    }
+            }
+        free(xcol); free(ccol);
+    }
+    free(sl);
+
+    /* shared expert: dense per-token MLP, batched over all B tokens */
+    if (tl->se_g[L] >= 0 && tl->se_u[L] >= 0 && tl->se_d[L] >= 0 &&
+        tl->se_gs[L] >= 0 && tl->se_us[L] >= 0 && tl->se_ds[L] >= 0 &&
+        tl->se_r[L] >= 0 && tl->se_rs[L] >= 0 && tl->se_rb[L] >= 0) {
+        long sm = tl->t[tl->se_g[L]].dims[0];   /* 512 */
+        if (sm > 0 && (size_t)B * sm * 4 <= tb_w_cap) {
+            float *sg = tb_w;
+            float *suv = tb_w + (size_t)B * sm;
+            float *scn = tb_w + 2 * (size_t)B * sm;
+            float *scol = (float *)malloc((size_t)sm * B * sizeof(float));
+            float *sd = (float *)malloc((size_t)B * H * sizeof(float));
+            float *sgt = (float *)malloc((size_t)B * sizeof(float));
+            if (scol && sd && sgt) {
+                /* xins is already [H][B] column-major = the shared
+                 * expert's x for all B tokens */
+                if (ds4f_mlx4_matvec_batch(
+                        (const uint32_t *)(const void *)(tr + tl->t[tl->se_g[L]].off),
+                        (const uint16_t *)(const void *)(tr + tl->t[tl->se_gs[L]].off),
+                        (const uint16_t *)(const void *)(tr + tl->t[tl->se_gb[L]].off),
+                        (int)sm, H, B, xins, sg) == 0 &&
+                    ds4f_mlx4_matvec_batch(
+                        (const uint32_t *)(const void *)(tr + tl->t[tl->se_u[L]].off),
+                        (const uint16_t *)(const void *)(tr + tl->t[tl->se_us[L]].off),
+                        (const uint16_t *)(const void *)(tr + tl->t[tl->se_ub[L]].off),
+                        (int)sm, H, B, xins, suv) == 0) {
+                    for (int b = 0; b < B; b++) {
+                        float *cr = scn + (size_t)b * sm;
+                        const float *gr = sg + (size_t)b * sm;
+                        const float *ur = suv + (size_t)b * sm;
+                        for (int i = 0; i < sm; i++) {
+                            float s = gr[i];
+                            float sig = 1.0f / (1.0f + expf(-s));
+                            cr[i] = s * sig * ur[i];
+                        }
+                    }
+                    for (int i = 0; i < sm; i++)
+                        for (int b = 0; b < B; b++)
+                            scol[(size_t)i * B + b] =
+                                scn[(size_t)b * sm + i];
+                    if (ds4f_mlx4_matvec_batch(
+                            (const uint32_t *)(const void *)(tr + tl->t[tl->se_d[L]].off),
+                            (const uint16_t *)(const void *)(tr + tl->t[tl->se_ds[L]].off),
+                            (const uint16_t *)(const void *)(tr + tl->t[tl->se_db[L]].off),
+                            H, (int)sm, B, scol, sd) == 0 &&
+                        ds4f_mlx4_matvec_batch(
+                            (const uint32_t *)(const void *)(tr + tl->t[tl->se_r[L]].off),
+                            (const uint16_t *)(const void *)(tr + tl->t[tl->se_rs[L]].off),
+                            (const uint16_t *)(const void *)(tr + tl->t[tl->se_rb[L]].off),
+                            1, H, B, xins, sgt) == 0) {
+                        for (int b = 0; b < B; b++) {
+                            float sg2 = 1.0f / (1.0f + expf(-sgt[b]));
+                            float *ac = tb_acc + (size_t)b * H;
+                            const float *dr = sd + (size_t)b * H;
+                            for (int i = 0; i < H; i++)
+                                ac[i] += sg2 * dr[i];
+                        }
+                        (*n_matvec) += 4 * B;
+                        (*n_decode) += (int64_t)B * (sm * H + sm * H + H * sm + H);
+                    }
+                }
+            }
+            free(scol); free(sd); free(sgt);
+        }
+    }
+
+    /* residual: state[b] += acc[b] (Qwen3.5 no-up path) */
+    for (int b = 0; b < B; b++) {
+        float *st = states[b];
+        const float *ac = tb_acc + (size_t)b * H;
+        for (int i = 0; i < H && i < Lat; i++) st[i] += ac[i];
+    }
     return 0;
 }

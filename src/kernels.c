@@ -6,6 +6,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 static int g_simd = 1;
 static __thread int g_in_expert = 0;
@@ -365,4 +368,252 @@ void ds4f_f16_matvec(const uint16_t *W, int R, int C, const float *x,
         for (int c = 0; c < C; c++) acc += ds4f_f16_to_f32(wr[c]) * x[c];
         y[r] = acc;
     }
+}
+
+/* ---- combined two-matvec row split (qkv + z, one spawn) ---------- */
+typedef struct {
+    const uint32_t *v1; const uint16_t *s1, *b1; int R1;
+    const uint32_t *v2; const uint16_t *s2, *b2; int R2;
+    int C;
+    const float *x;
+    float *y1, *y2;
+    int r0, r1;          /* combined row range [r0, r1) over R1+R2 */
+} Mlx4RowJob2;
+
+static void *mlx4_row_worker2(void *arg) {
+    Mlx4RowJob2 *j = (Mlx4RowJob2 *)arg;
+    /* combined row space: [0,R1) -> matvec 1, [R1, R1+R2) -> matvec 2 */
+    if (j->r1 <= j->R1) {
+        ds4f_simd_mlx4_matvec(j->v1, j->s1, j->b1, j->R1, j->C,
+                              j->x, j->y1, j->r0, j->r1);
+    } else if (j->r0 >= j->R1) {
+        ds4f_simd_mlx4_matvec(j->v2, j->s2, j->b2, j->R2, j->C,
+                              j->x, j->y2, j->r0 - j->R1, j->r1 - j->R1);
+    } else {
+        ds4f_simd_mlx4_matvec(j->v1, j->s1, j->b1, j->R1, j->C,
+                              j->x, j->y1, j->r0, j->R1);
+        ds4f_simd_mlx4_matvec(j->v2, j->s2, j->b2, j->R2, j->C,
+                              j->x, j->y2, 0, j->r1 - j->R1);
+    }
+    return NULL;
+}
+
+/* Two independent MLX4 matvecs with the same x, computed in ONE
+ * 8-way row split over the combined row space (R1+R2). The linear
+ * attention qkv (8192 rows) and z (4096) projections both read xin
+ * and write disjoint outputs -- running them sequentially cost two
+ * spawn/join cycles per layer; this overlaps them. Same per-row
+ * math as ds4f_mlx4_matvec (bit-identical rows), just partitioned
+ * together. Returns 0 if both computed, -1 on fallback. */
+int ds4f_mlx4_matvec2(const uint32_t *v1, const uint16_t *s1,
+                      const uint16_t *b1, int R1,
+                      const uint32_t *v2, const uint16_t *s2,
+                      const uint16_t *b2, int R2, int C,
+                      const float *x, float *y1, float *y2) {
+    if (!ds4f_kernels_simd() || (C % 8) != 0 ||
+        (C % DS4F_MLX4_GROUP) != 0 || R1 < 1 || R2 < 1)
+        return -1;
+    if (ds4f_kernels_in_expert()) return -1;   /* expert threads: no spawn */
+    int nth = 8;
+    const char *env = getenv("DS4F_ATTN_THREADS");
+    if (env) {
+        int v = atoi(env);
+        if (v >= 1 && v <= 32) nth = v;
+    }
+    if (nth < 2) {
+        ds4f_simd_mlx4_matvec(v1, s1, b1, R1, C, x, y1, 0, R1);
+        ds4f_simd_mlx4_matvec(v2, s2, b2, R2, C, x, y2, 0, R2);
+        return 0;
+    }
+    int total = R1 + R2;
+    int chunk = (total + nth - 1) / nth;
+    pthread_t th[32];
+    Mlx4RowJob2 job[32];
+    int nspawn = 0;
+    for (int t = 0; t < nth; t++) {
+        int r0 = t * chunk;
+        int r1 = (t + 1) * chunk < total ? (t + 1) * chunk : total;
+        if (r0 >= total) continue;
+        job[t].v1 = v1; job[t].s1 = s1; job[t].b1 = b1; job[t].R1 = R1;
+        job[t].v2 = v2; job[t].s2 = s2; job[t].b2 = b2; job[t].R2 = R2;
+        job[t].C = C; job[t].x = x; job[t].y1 = y1; job[t].y2 = y2;
+        job[t].r0 = r0; job[t].r1 = r1;
+        pthread_create(&th[t], NULL, mlx4_row_worker2, &job[t]);
+        nspawn++;
+    }
+    for (int t = 0; t < nspawn; t++)
+        pthread_join(th[t], NULL);
+    return 0;
+}
+
+/* ---- batched prefill matvec (M1 of prefill-batch) ---------------- */
+/* Y[B][R] = W[R x C] * X, where X is ROW-MAJOR [B][C] (each token's
+ * row contiguous -- the layout the per-token SIMD FMA loop needs).
+ * The 4-bit row is decoded ONCE (dequant amortized over the B token
+ * vectors), then each token runs the EXACT ds4f_simd_mlx4_matvec
+ * accumulation topology: 8 vector accumulators with the (c>>2)&7
+ * column map, same FMA chains, same reduction order -- so results
+ * are BIT-IDENTICAL per (row, token) to the serial SIMD matvec, not
+ * merely close. The recurrent delta-rule state amplifies any 1-ULP
+ * difference into divergent generation; this preserves the map. */
+typedef struct {
+    const uint32_t *vals; const uint16_t *scales, *biases;
+    int R, C, B;
+    const float *xs;   /* [B][C] row-major */
+    float *ys;         /* [B][R] row-major */
+    int r0, r1;        /* row range [r0, r1) of W */
+} Mlx4BatchJob;
+
+static void *mlx4_batch_worker(void *arg) {
+    Mlx4BatchJob *j = (Mlx4BatchJob *)arg;
+    const int C = j->C, B = j->B;
+    /* decoded row scratch (per worker): C floats, grown on demand */
+    static __thread float *trow = NULL;
+    static __thread size_t trow_cap = 0;
+    if ((size_t)C > trow_cap) {
+        float *nb = (float *)realloc(trow, (size_t)C * sizeof(float));
+        if (!nb) return NULL;
+        trow = nb; trow_cap = (size_t)C;
+    }
+    float *wrow = trow;
+    for (int r = j->r0; r < j->r1; r++) {
+        /* decode this row ONCE. Group index ABSOLUTE across R*C
+         * ((r*C+c)/64), exactly like simd.c:158 -- per-row c/64
+         * reads row 0's scales (the divergence bug). */
+        const uint32_t *vr = j->vals + (size_t)r * (C / 8);
+        int ng = (C + DS4F_MLX4_GROUP - 1) / DS4F_MLX4_GROUP;
+        float srow[64], brow[64];
+        for (int g = 0; g < ng && g < 64; g++) {
+            size_t absg = ((size_t)r * C + (size_t)g * DS4F_MLX4_GROUP)
+                          / DS4F_MLX4_GROUP;
+            uint32_t sb = (uint32_t)j->scales[absg] << 16;
+            uint32_t bb = j->biases ? (uint32_t)j->biases[absg] << 16 : 0;
+            memcpy(&srow[g], &sb, 4);
+            memcpy(&brow[g], &bb, 4);
+        }
+#ifdef __aarch64__
+        if (ds4f_kernels_simd()) {
+            /* vector decode into wrow: same FMA per element as the
+             * serial kernel's d0..d3 (bv + q*sv), stored once */
+            int c = 0, w = 0;
+            for (; c + 15 < C; c += 16, w += 2) {
+                int g = c / DS4F_MLX4_GROUP;
+                float32x4_t sv = vdupq_n_f32(srow[g]);
+                float32x4_t bv = vdupq_n_f32(brow[g]);
+                uint32_t u0 = vr[w], u1 = vr[w + 1];
+                uint8x8_t b0 = vreinterpret_u8_u32(vdup_n_u32(u0));
+                uint8x8_t b1 = vreinterpret_u8_u32(vdup_n_u32(u1));
+                uint8x8_t lo0 = vand_u8(b0, vdup_n_u8(0x0F));
+                uint8x8_t hi0 = vand_u8(vshr_n_u8(b0, 4), vdup_n_u8(0x0F));
+                uint8x8_t lo1 = vand_u8(b1, vdup_n_u8(0x0F));
+                uint8x8_t hi1 = vand_u8(vshr_n_u8(b1, 4), vdup_n_u8(0x0F));
+                uint8x8_t n0 = vzip_u8(lo0, hi0).val[0];
+                uint8x8_t n1 = vzip_u8(lo1, hi1).val[0];
+                uint32x4_t q00 = vmovl_u16(vget_low_u16(vmovl_u8(n0)));
+                uint32x4_t q01 = vmovl_u16(vget_high_u16(vmovl_u8(n0)));
+                uint32x4_t q10 = vmovl_u16(vget_low_u16(vmovl_u8(n1)));
+                uint32x4_t q11 = vmovl_u16(vget_high_u16(vmovl_u8(n1)));
+                vst1q_f32(wrow + c,     vmlaq_f32(bv, vcvtq_f32_u32(q00), sv));
+                vst1q_f32(wrow + c + 4, vmlaq_f32(bv, vcvtq_f32_u32(q01), sv));
+                vst1q_f32(wrow + c + 8, vmlaq_f32(bv, vcvtq_f32_u32(q10), sv));
+                vst1q_f32(wrow + c + 12, vmlaq_f32(bv, vcvtq_f32_u32(q11), sv));
+            }
+            /* scalar tail decode (C % 16 != 0) */
+            for (; c < C; c++) {
+                long k = (size_t)r * C + c;
+                int gl = (int)((c) / DS4F_MLX4_GROUP);
+                long wl = (k - (size_t)r * C) >> 3;
+                int q = (int)((vr[wl] >> (4 * (k & 7))) & 0xFu);
+                wrow[c] = (float)q * srow[gl] + brow[gl];
+            }
+            /* per-token FMA: the EXACT serial topology -- 8 vector
+             * accumulators, (c>>2)&7 map, same reduction order */
+            for (int t = 0; t < B; t++) {
+                const float *xt = j->xs + (size_t)t * C;
+                float32x4_t acc[8];
+                for (int a = 0; a < 8; a++) acc[a] = vdupq_n_f32(0.0f);
+                int c = 0;
+                for (; c + 15 < C; c += 16) {
+                    int ab = (c >> 2) & 7;   /* 0 or 4 for c%16==0 */
+                    acc[ab + 0] = vmlaq_f32(acc[ab + 0],
+                                            vld1q_f32(wrow + c),
+                                            vld1q_f32(xt + c));
+                    acc[ab + 1] = vmlaq_f32(acc[ab + 1],
+                                            vld1q_f32(wrow + c + 4),
+                                            vld1q_f32(xt + c + 4));
+                    acc[ab + 2] = vmlaq_f32(acc[ab + 2],
+                                            vld1q_f32(wrow + c + 8),
+                                            vld1q_f32(xt + c + 8));
+                    acc[ab + 3] = vmlaq_f32(acc[ab + 3],
+                                            vld1q_f32(wrow + c + 12),
+                                            vld1q_f32(xt + c + 12));
+                }
+                float32x4_t s4 = vdupq_n_f32(0.0f);
+                for (int a = 0; a < 8; a++) s4 = vaddq_f32(s4, acc[a]);
+                float32x2_t tt = vadd_f32(vget_low_f32(s4),
+                                          vget_high_f32(s4));
+                float s = vget_lane_f32(tt, 0) + vget_lane_f32(tt, 1);
+                for (; c < C; c++) s += wrow[c] * xt[c];  /* tail */
+                j->ys[(size_t)t * j->R + r] = s;
+            }
+        } else
+#endif
+        {
+            /* scalar fallback: decode wrow scalar, c-order accumulate */
+            for (int c = 0; c < C; c++) {
+                long k = (size_t)r * C + c;
+                int gl = (int)(k / DS4F_MLX4_GROUP);
+                long wl = (k - (size_t)r * C) >> 3;
+                int q = (int)((vr[wl] >> (4 * (k & 7))) & 0xFu);
+                wrow[c] = (float)q * srow[gl] + brow[gl];
+            }
+            for (int t = 0; t < B; t++) {
+                const float *xt = j->xs + (size_t)t * C;
+                float s = 0.0f;
+                for (int c = 0; c < C; c++) s += wrow[c] * xt[c];
+                j->ys[(size_t)t * j->R + r] = s;
+            }
+        }
+    }
+    return NULL;
+}
+
+int ds4f_mlx4_matvec_batch(const uint32_t *vals, const uint16_t *scales,
+                           const uint16_t *biases, int R, int C, int B,
+                           const float *xs, float *ys) {
+    if (!ds4f_kernels_simd() || (C % 8) != 0 || R < 1 || B < 1)
+        return -1;
+    if (ds4f_kernels_in_expert()) return -1;
+    int nth = 8;
+    const char *env = getenv("DS4F_ATTN_THREADS");
+    if (env) {
+        int v = atoi(env);
+        if (v >= 1 && v <= 32) nth = v;
+    }
+    if (nth < 2 || R < nth) {
+        Mlx4BatchJob j;
+        j.vals = vals; j.scales = scales; j.biases = biases;
+        j.R = R; j.C = C; j.B = B; j.xs = xs; j.ys = ys;
+        j.r0 = 0; j.r1 = R;
+        mlx4_batch_worker(&j);
+        return 0;
+    }
+    int chunk = (R + nth - 1) / nth;
+    pthread_t th[32];
+    Mlx4BatchJob job[32];
+    int nspawn = 0;
+    for (int t = 0; t < nth; t++) {
+        int r0 = t * chunk;
+        int r1 = (t + 1) * chunk < R ? (t + 1) * chunk : R;
+        if (r0 >= R) continue;
+        job[t].vals = vals; job[t].scales = scales; job[t].biases = biases;
+        job[t].R = R; job[t].C = C; job[t].B = B;
+        job[t].xs = xs; job[t].ys = ys;
+        job[t].r0 = r0; job[t].r1 = r1;
+        pthread_create(&th[t], NULL, mlx4_batch_worker, &job[t]);
+        nspawn++;
+    }
+    for (int t = 0; t < nspawn; t++)
+        pthread_join(th[t], NULL);
+    return 0;
 }

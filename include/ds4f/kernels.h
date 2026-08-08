@@ -125,4 +125,20 @@ void ds4f_mlx4_matvec(const uint32_t *vals, const uint16_t *scales,
                       const uint16_t *biases, int R, int C,
                       const float *x, float *y);
 
+/* Two independent MLX4 matvecs (same x, disjoint outputs) in ONE
+ * 8-way row split over the combined row space -- overlaps the linear
+ * attention qkv+z projections instead of two sequential spawns. */
+int ds4f_mlx4_matvec2(const uint32_t *v1, const uint16_t *s1,
+                      const uint16_t *b1, int R1,
+                      const uint32_t *v2, const uint16_t *s2,
+                      const uint16_t *b2, int R2, int C,
+                      const float *x, float *y1, float *y2);
+
+/* Batched prefill matvec (M1 of prefill-batch): Y[B][R] = W[R x C] *
+ * X[B][C]. Dequant once per weight row, reuse across B token
+ * vectors. Bit-identical per (row, token) to ds4f_mlx4_matvec. */
+int ds4f_mlx4_matvec_batch(const uint32_t *vals, const uint16_t *scales,
+                           const uint16_t *biases, int R, int C, int B,
+                           const float *xs, float *ys);
+
 #endif /* DS4F_KERNELS_H */
