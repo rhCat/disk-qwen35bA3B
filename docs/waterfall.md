@@ -1,0 +1,101 @@
+# Token-generation waterfall — measured breakdown
+
+The per-token cost of the engine, decomposed by phase. Measured with
+`DS4F_WATERFALL=1` (per-phase timers in the decode loop, printed after
+the run report). All runs: CPU path (no DS4F_GPU), greedy, cache-gb 5,
+pin-layers 4.
+
+## 5-token prompt, GEN=80 (the short-context baseline)
+
+| phase | before NEON delta rule | after (f466206) | Δ |
+|---|---|---|---|
+| attn  | 70.8 ms (44.4%) | 57.7-59.7 ms (40%) | **-18%** |
+| moe   | 47.4 ms (29.8%) | 47.5-49.4 ms (33%) | ~0 |
+| fetch | 24.8 ms (15.6%) | 22.4-25.0 ms (16%) | ~0 |
+| head  | 10.8 ms (6.8%)  | 10.9 ms (7.5%) | ~0 |
+| router| 3.2 ms (2.0%)  | 3.2 ms (2.1%) | ~0 |
+| misc  | 2.2 ms (1.4%)  | 2.3 ms (1.6%) | ~0 |
+| total | 159.3 ms       | 144-151 ms | **-9%** |
+| s/token | 0.16          | 0.14-0.15 | **-12%** (6.3 -> 7.1 tok/s) |
+
+## 2K-token QA (2017-token prompt, post-NEON binary)
+
+GEN=1 prompt pass: 339.4 s / 2017 tokens = **0.168 s/token**.
+GEN=8: 336.9 s / 2025 = **0.167 s/token** (0.14-0.15 at 5 tokens +
+a modest depth premium). Cache: 77.2% hit, 0 dropped. PEAK RSS
+5.89 GB (GEN=1) / 6.90 GB (GEN=8).
+
+Per-token waterfall at 2K (GEN=1, prompt pass):
+
+| phase | ms/token | % |
+|---|---|---|
+| attn  | 73.8 | 43.8% |
+| moe   | 41.7 | 24.8% |
+| fetch | 38.1 | 22.7% |
+| head  | 10.7 | 6.3% |
+| router| 3.0  | 1.8% |
+
+The fetch phase grows the most with context (25 ms at 5 tokens ->
+38 ms at 2K): longer prompts touch more unique expert sets, and the
+2825-slot cache (cache-gb 5) hit rate falls. attn stays flat
+(57.7 -> 73.8 ms/token is the GEN=1 prompt-pass measure, which
+includes the first-token state fill; the delta rule is O(1) per
+token).
+
+## What each phase IS (from the code)
+
+- **attn** (40-44%): the Gated DeltaNet linear attention -- 39/40
+  layers run the recurrent delta rule (state decay, kv_mem, delta,
+  outer update, readout: 32 heads x 128x128 state) + the
+  linear-attention projection matvecs (qkv 8192x2048, z 4096x2048,
+  o 2048x2048 per layer, row-split). Layer 39 is one MLA/GQA softmax
+  layer (naive full softmax, kvhalf fallback). NOT flash attention;
+  the delta rule is O(1) per token, not O(position).
+- **moe** (25-33%): 8 routed experts x 40 layers x 3 matvecs each
+  (gate/up 512x2048, down 2048x512) -- fused decode+FMA,
+  context-aware row-split, 8 expert threads.
+- **fetch** (16-23%): expert fetch -- 8 experts x 40 layers from the
+  2825-slot LRU cache (cache-gb 5), 4 fetch threads; disk read on
+  miss. Trunk reads are flat ~693 MB/token at every depth (never the
+  bottleneck -- pin-test proved: trunk 304 GB -> 1 MB with flat time).
+- **head** (6-7.5%): lm_head 248320x2048 MLX-4 matvec (row-split 8).
+- **router** (2%): gate scores (40x2048) + topk.
+- **misc** (1.6%): norms, residual combine, sampling, embed.
+
+## Context scaling
+
+| prompt | per-token (pre-NEON) | per-token (post-NEON) | cache hit | trunk read/token |
+|---|---|---|---|---|
+| 5 tok | 0.16-0.17 s | 0.14-0.15 s | ~70% | ~745 MB |
+| 2017 tok | 0.192 s | **0.168 s** | 77.2% | 693 MB |
+| 4017 tok | 0.231 s | (not re-run) | 68.4% | 693 MB |
+
+The rate degrades with context NOT because attention grows (the delta
+rule is O(1) per token) but because longer contexts touch more unique
+expert sets -> cache hits drop (77 -> 68%) and the fetch phase grows.
+Trunk I/O stays flat -- disk is never the bound.
+
+## History (how the waterfall moved this session)
+
+| commit | change | s/token (5-tok) | s/token (2K) | attn | moe |
+|---|---|---|---|---|---|
+| 02a1341 | row-split main | 0.17 | 0.192 | 70.8 | 47.4 |
+| f466206 | NEON delta rule | 0.14-0.15 | **0.168** | 57.7 | 47.5 |
+
+Earlier in the session: malloc kill + fusion (0.24 -> 0.23),
+context-aware row-split (0.23 -> 0.17). The GPU batched expert
+offload measured 0.50 s/token (3x worse) and was rejected --
+per-dispatch Metal sync overhead at 80 dispatches/token swamps the
+compute.
+
+## How to reproduce
+
+```
+DS4F_WATERFALL=1 bash tools/run-clean.sh ./ds4f /tmp/q35-trunk \
+  --trunk /tmp/q35-trunk/trunk.bin --offsets /tmp/q35-trunk/trunk.offsets \
+  --layout-trunk /tmp/q35-trunk/trunk.json \
+  --pool /tmp/q35-pool/pool.bin --layout-pool /tmp/q35-pool/manifest.json \
+  --head /tmp/q35-trunk/head.json --embed /tmp/q35-trunk/embed.json \
+  --tokenizer ~/.cache/huggingface/mlx-qwen35-a3b-4bit/tokenizer.json \
+  --pids-file /tmp/q35-2k-ids.txt --gen 8 --cache-gb 5 --pin-layers 4
+```
