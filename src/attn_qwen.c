@@ -808,9 +808,18 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         }
     }
     /* out_proj(readout) -> o, residual add */
+    double _to = 0;
+    if (getenv("DS4F_PROJ_MS")) _to = now_s();
     if (mlx4_proj(tl, oi, os_, ob, tr, o_rows, v_heads * vd, readout, o)
         != 0) {
         return -1;
+    }
+    if (getenv("DS4F_PROJ_MS")) {
+        static double _oacc = 0; static long _ocnt = 0;
+        _oacc += now_s() - _to; _ocnt++;
+        if (_ocnt <= 3 || _ocnt % 100 == 0)
+            fprintf(stderr, "[proj-o] L%d o: %.2f ms (avg %.2f)\n",
+                    L, (now_s() - _to) * 1e3, _oacc / _ocnt * 1e3);
     }
     if (getenv("DS4F_NAN_PROBE") && L == 0 &&
         (token == 0 || token == 1)) {
