@@ -231,13 +231,37 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     float *ck = kv->kv + ((size_t)L * kv->max_tokens + token) * kvlat;
     memcpy(ck, k, (size_t)krows * sizeof(float));
     memcpy(ck + krows, v, (size_t)vrows * sizeof(float));
+    if (getenv("DS4F_DUMP_Z") && L == 3 && token == 0) {
+        FILE *xf = fopen("/tmp/q35-eng-gqak0.bin", "wb");
+        if (xf) {
+            fwrite(k, sizeof(float), (size_t)krows, xf);
+            fwrite(v, sizeof(float), (size_t)vrows, xf);
+            fclose(xf);
+        }
+        /* also dump the whole L3 K/V cache region (first 8 slots) */
+        FILE *cf = fopen("/tmp/q35-eng-gqakv3.bin", "wb");
+        if (cf) {
+            fwrite(kv->kv + (size_t)L * kv->max_tokens * kvlat,
+                   sizeof(float),
+                   (size_t)8 * kvlat, cf);
+            fclose(cf);
+        }
+    }
 
     /* attention: 16 q-heads over 2 kv-heads (repeat_kv 8), 0..token */
     float dscale = 1.0f / sqrtf((float)kh);
     /* scores/wgt are arena slices (sized to max_tokens at init) */
     memset(scores, 0, (size_t)kv->max_tokens * sizeof(float));
     memset(wgt, 0, (size_t)kv->max_tokens * sizeof(float));
-    memset(attn_out, 0, (size_t)orows * sizeof(float));
+    /* BUGFIX: memset attn_out to ocols (4096), NOT orows (2048).
+     * attn_out is 16 heads x 256 = ocols floats; zeroing only orows
+     * leaves heads 8-15 with stale data from the previous call. The
+     * serial path masked this because linear_step memsets the whole
+     * shared arena (kv->scratch) every layer -- the chunk's
+     * linear_step_chunk uses its own bbuf and never touches the
+     * arena, exposing the stale second half (L3 state exploded to
+     * rms 2508 vs 0.024; attn-rms 0.038 vs 0.103 at t0). */
+    memset(attn_out, 0, (size_t)ocols * sizeof(float));
     int npos = token + 1;
     for (int h = 0; h < heads; h++) {
         const float *qh_ptr = qq + (size_t)h * kh;
@@ -314,12 +338,17 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                     bf16_f(qwnp[3]),
                     gate[0], gate[1], gate[2], gate[3]);
         }
-        if (getenv("DS4F_DUMP_Z")) {
+        if (getenv("DS4F_DUMP_Z") && token == 0) {
             FILE *qf = fopen("/tmp/q35-eng-gqaq.bin", "wb");
             if (qf) {
                 fwrite(qq, sizeof(float), (size_t)heads * kh, qf);
                 fwrite(gate, sizeof(float), (size_t)heads * kh, qf);
                 fclose(qf);
+            }
+            FILE *af = fopen("/tmp/q35-eng-gqaattn.bin", "wb");
+            if (af) {
+                fwrite(attn_out, sizeof(float), (size_t)ocols, af);
+                fclose(af);
             }
             FILE *xf = fopen("/tmp/q35-eng-gqaxin.bin", "wb");
             if (xf) {
