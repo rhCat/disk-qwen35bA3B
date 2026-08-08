@@ -393,9 +393,17 @@ static int gqa_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
  */
 #define Q3_CONV_K 4
 
-static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
-                       const uint8_t *tr, float *state, Ds4fKvCache *kv,
-                       int token) {
+/* The SERIAL body of the Gated DeltaNet layer: a/b gates ->
+ * conv1d -> q/k norm -> delta-rule state update -> readout ->
+ * RMSNormGated -> o_proj -> residual. Everything after the qkv+z
+ * projections. This part MUST run per token (conv ring + delta state
+ * are serial chains); the projections that feed it are batchable
+ * (linear_step_chunk, the prefill path). Indices/geometry are
+ * re-derived from tl/cfg/L. buf layout (same as linear_step):
+ * [xin H][qkv qkv_rows][z z_rows][o o_rows][readout v_heads*vd][qk]. */
+static int lin_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
+                    const uint8_t *tr, Ds4fKvCache *kv, int token,
+                    float *state, float *qkv, float *z, float *buf) {
     int pi = tl->q3_pqkv[L], ps = tl->q3_pqkvs[L], pb = tl->q3_pqkvb[L];
     int zi = tl->q3_pz[L], zs = tl->q3_pzs[L], zb = tl->q3_pzb[L];
     int ai = tl->q3_pa[L], as_ = tl->q3_pas[L], ab = tl->q3_pab[L];
@@ -404,104 +412,19 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     int oi = tl->q3_opa[L], os_ = tl->q3_opas[L], ob = tl->q3_opab[L];
     int ni = tl->q3_lnorm[L];
     int ai_ = tl->q3_a_log[L], di = tl->q3_dt[L];
-    int iln = tl->attn_norm[L];
-    if (pi < 0 || zi < 0 || ai < 0 || bi < 0 || ci < 0 || oi < 0 ||
-        ni < 0 || ai_ < 0 || di < 0) {
-        if (getenv("DS4F_NAN_PROBE") && L < 3)
-            fprintf(stderr, "[lin] L%d SKIP pi=%d zi=%d ai=%d bi=%d "
-                    "ci=%d oi=%d ni=%d Al=%d dt=%d\n", L, pi, zi, ai, bi,
-                    ci, oi, ni, ai_, di);
-        return 0;                    /* incomplete graph: skip */
-    }
     int H = cfg->hidden;
-    int qkv_rows = (int)tl->t[pi].dims[0];      /* 8192 */
-    int z_rows = (int)tl->t[zi].dims[0];        /* 4096 */
-    int o_rows = (int)tl->t[oi].dims[0];        /* 2048 */
+    int qkv_rows = (int)tl->t[pi].dims[0];
+    int z_rows = (int)tl->t[zi].dims[0];
+    int o_rows = (int)tl->t[oi].dims[0];
     int cols = (int)tl->t[pi].dims[1] * 8;      /* decoded 2048 = H */
-    /* head geometry (from the model config) */
     int k_heads = 16, v_heads = 32, kd = 128, vd = 128;
-    if (cfg->n_heads > 0) k_heads = cfg->n_heads;      /* 16 */
-    if (cfg->n_kv_heads > 0) v_heads = cfg->n_kv_heads * 16; /* 2x16=32 */
-    if (qkv_rows != k_heads * kd * 2 + v_heads * vd) {
-        if (getenv("DS4F_NAN_PROBE") && L < 3)
-            fprintf(stderr, "[lin] L%d GEOM qkv_rows=%d want=%d\n", L,
-                    qkv_rows, k_heads * kd * 2 + v_heads * vd);
-        fprintf(stderr, "qwen lin: L%d qkv %d != k %d*%d*2 + v %d*%d\n",
-                L, qkv_rows, k_heads, kd, v_heads, vd);
-        return -1;
-    }
-    if (z_rows != v_heads * vd || o_rows != H) {
-        if (getenv("DS4F_NAN_PROBE") && L < 3)
-            fprintf(stderr, "[lin] L%d GEOM z_rows=%d o_rows=%d\n", L,
-                    z_rows, o_rows);
-        return -1;
-    }
-    if (getenv("DS4F_NAN_PROBE") && L < 3)
-        fprintf(stderr, "[lin] L%d enter ok\n", L);
-    if (!kv || token < 0 || token >= kv->max_tokens) return 0;
-    if (!kv->lin_alloc)
-        if (ds4f_kv_lin_init(kv, v_heads, kd, vd) != 0) return -1;
-    if (!kv->conv_alloc)
-        if (ds4f_kv_conv_init(kv, qkv_rows) != 0) return -1;
-    /* the conv1d ring lives in the kv cache: it must survive across
-     * tokens (the causal conv reads the PREVIOUS qkv vectors) */
-    float *conv_ring = kv->conv + (size_t)L * 4 * qkv_rows;
-
-    float *buf = kv->scratch;   /* arena, sized at init (never per-call) */
-    float *xin = buf;               /* input_layernorm(state) */
-    float *qkv = xin + H;
-    float *z = qkv + qkv_rows;
+    if (cfg->n_heads > 0) k_heads = cfg->n_heads;
+    if (cfg->n_kv_heads > 0) v_heads = cfg->n_kv_heads * 16;
+    float *xin = buf;
     float *o = z + z_rows;
-    float *readout = o + o_rows;              /* v_heads*vd */
-    float *qk = readout + v_heads * vd;       /* k_heads*kd (q) + k */
-    /* NOTE: linear_step and gqa_step share kv->scratch. They are called
-     * sequentially (one per layer), so reuse is safe. */
-    memset(buf, 0, (size_t)(H + qkv_rows + z_rows + o_rows +
-                 v_heads * vd + v_heads * kd + 2 * H + 1) *
-                 sizeof(float));
-
-    /* reference: x = x + GatedDeltaNet(input_layernorm(x)) */
-    if (iln >= 0) {
-        const uint16_t *nw = (const uint16_t *)(const void *)(tr +
-                             tl->t[iln].off);
-        memcpy(xin, state, (size_t)H * sizeof(float));
-        double ss = 0.0;
-        for (int i = 0; i < H; i++) ss += (double)xin[i] * xin[i];
-        float r = sqrtf((float)(ss / (double)H) + 1e-6f);
-        for (int i = 0; i < H; i++) {
-            uint32_t bits = (uint32_t)nw[i] << 16;
-            float w;
-            memcpy(&w, &bits, 4);
-            xin[i] = xin[i] / r * w;
-        }
-    } else {
-        memcpy(xin, state, (size_t)H * sizeof(float));
-    }
-
-    double _tproj = 0;
-    if (getenv("DS4F_PROJ_MS")) _tproj = now_s();
-    if (ds4f_mlx4_matvec2(
-            (const uint32_t *)(const void *)(tr + tl->t[pi].off),
-            (const uint16_t *)(const void *)(tr + tl->t[ps].off),
-            pb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[pb].off)
-                    : NULL, qkv_rows,
-            (const uint32_t *)(const void *)(tr + tl->t[zi].off),
-            (const uint16_t *)(const void *)(tr + tl->t[zs].off),
-            zb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[zb].off)
-                    : NULL, z_rows,
-            cols, xin, qkv, z) != 0) {
-        if (mlx4_proj(tl, pi, ps, pb, tr, qkv_rows, cols, xin, qkv) != 0 ||
-            mlx4_proj(tl, zi, zs, zb, tr, z_rows, cols, xin, z) != 0) {
-            return -1;
-        }
-    }
-    if (getenv("DS4F_PROJ_MS")) {
-        static double _pacc = 0; static long _pcnt = 0;
-        _pacc += now_s() - _tproj; _pcnt++;
-        if (_pcnt <= 3 || _pcnt % 100 == 0)
-            fprintf(stderr, "[proj] L%d qkv+z: %.2f ms (avg %.2f)\n",
-                    L, (now_s() - _tproj) * 1e3, _pacc / _pcnt * 1e3);
-    }
+    float *readout = o + o_rows;
+    float *qk = readout + v_heads * vd;
+    float *conv_ring = kv->conv + (size_t)L * 4 * qkv_rows;
     float a32[32], b32[32];
     {
         float tmp[32];
@@ -870,7 +793,223 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 xin[0], xin[1], xin[2], xin[3]);
     }
     for (int i = 0; i < H; i++) state[i] += o[i];
+}
 
+static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
+                       const uint8_t *tr, float *state, Ds4fKvCache *kv,
+                       int token) {
+    int pi = tl->q3_pqkv[L], ps = tl->q3_pqkvs[L], pb = tl->q3_pqkvb[L];
+    int zi = tl->q3_pz[L], zs = tl->q3_pzs[L], zb = tl->q3_pzb[L];
+    int ai = tl->q3_pa[L], as_ = tl->q3_pas[L], ab = tl->q3_pab[L];
+    int bi = tl->q3_pb[L], bs_ = tl->q3_pbs[L], bb = tl->q3_pbb[L];
+    int ci = tl->q3_conv[L];
+    int oi = tl->q3_opa[L], os_ = tl->q3_opas[L], ob = tl->q3_opab[L];
+    int ni = tl->q3_lnorm[L];
+    int ai_ = tl->q3_a_log[L], di = tl->q3_dt[L];
+    int iln = tl->attn_norm[L];
+    if (pi < 0 || zi < 0 || ai < 0 || bi < 0 || ci < 0 || oi < 0 ||
+        ni < 0 || ai_ < 0 || di < 0) {
+        if (getenv("DS4F_NAN_PROBE") && L < 3)
+            fprintf(stderr, "[lin] L%d SKIP pi=%d zi=%d ai=%d bi=%d "
+                    "ci=%d oi=%d ni=%d Al=%d dt=%d\n", L, pi, zi, ai, bi,
+                    ci, oi, ni, ai_, di);
+        return 0;                    /* incomplete graph: skip */
+    }
+    int H = cfg->hidden;
+    int qkv_rows = (int)tl->t[pi].dims[0];      /* 8192 */
+    int z_rows = (int)tl->t[zi].dims[0];        /* 4096 */
+    int o_rows = (int)tl->t[oi].dims[0];        /* 2048 */
+    int cols = (int)tl->t[pi].dims[1] * 8;      /* decoded 2048 = H */
+    /* head geometry (from the model config) */
+    int k_heads = 16, v_heads = 32, kd = 128, vd = 128;
+    if (cfg->n_heads > 0) k_heads = cfg->n_heads;      /* 16 */
+    if (cfg->n_kv_heads > 0) v_heads = cfg->n_kv_heads * 16; /* 2x16=32 */
+    if (qkv_rows != k_heads * kd * 2 + v_heads * vd) {
+        if (getenv("DS4F_NAN_PROBE") && L < 3)
+            fprintf(stderr, "[lin] L%d GEOM qkv_rows=%d want=%d\n", L,
+                    qkv_rows, k_heads * kd * 2 + v_heads * vd);
+        fprintf(stderr, "qwen lin: L%d qkv %d != k %d*%d*2 + v %d*%d\n",
+                L, qkv_rows, k_heads, kd, v_heads, vd);
+        return -1;
+    }
+    if (z_rows != v_heads * vd || o_rows != H) {
+        if (getenv("DS4F_NAN_PROBE") && L < 3)
+            fprintf(stderr, "[lin] L%d GEOM z_rows=%d o_rows=%d\n", L,
+                    z_rows, o_rows);
+        return -1;
+    }
+    if (getenv("DS4F_NAN_PROBE") && L < 3)
+        fprintf(stderr, "[lin] L%d enter ok\n", L);
+    if (!kv || token < 0 || token >= kv->max_tokens) return 0;
+    if (!kv->lin_alloc)
+        if (ds4f_kv_lin_init(kv, v_heads, kd, vd) != 0) return -1;
+    if (!kv->conv_alloc)
+        if (ds4f_kv_conv_init(kv, qkv_rows) != 0) return -1;
+    /* the conv1d ring lives in the kv cache: it must survive across
+     * tokens (the causal conv reads the PREVIOUS qkv vectors) */
+    float *conv_ring = kv->conv + (size_t)L * 4 * qkv_rows;
+
+    float *buf = kv->scratch;   /* arena, sized at init (never per-call) */
+    float *xin = buf;               /* input_layernorm(state) */
+    float *qkv = xin + H;
+    float *z = qkv + qkv_rows;
+    float *o = z + z_rows;
+    float *readout = o + o_rows;              /* v_heads*vd */
+    float *qk = readout + v_heads * vd;       /* k_heads*kd (q) + k */
+    /* NOTE: linear_step and gqa_step share kv->scratch. They are called
+     * sequentially (one per layer), so reuse is safe. */
+    memset(buf, 0, (size_t)(H + qkv_rows + z_rows + o_rows +
+                 v_heads * vd + v_heads * kd + 2 * H + 1) *
+                 sizeof(float));
+
+    /* reference: x = x + GatedDeltaNet(input_layernorm(x)) */
+    if (iln >= 0) {
+        const uint16_t *nw = (const uint16_t *)(const void *)(tr +
+                             tl->t[iln].off);
+        memcpy(xin, state, (size_t)H * sizeof(float));
+        double ss = 0.0;
+        for (int i = 0; i < H; i++) ss += (double)xin[i] * xin[i];
+        float r = sqrtf((float)(ss / (double)H) + 1e-6f);
+        for (int i = 0; i < H; i++) {
+            uint32_t bits = (uint32_t)nw[i] << 16;
+            float w;
+            memcpy(&w, &bits, 4);
+            xin[i] = xin[i] / r * w;
+        }
+    } else {
+        memcpy(xin, state, (size_t)H * sizeof(float));
+    }
+
+    double _tproj = 0;
+    if (getenv("DS4F_PROJ_MS")) _tproj = now_s();
+    if (ds4f_mlx4_matvec2(
+            (const uint32_t *)(const void *)(tr + tl->t[pi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[ps].off),
+            pb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[pb].off)
+                    : NULL, qkv_rows,
+            (const uint32_t *)(const void *)(tr + tl->t[zi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[zs].off),
+            zb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[zb].off)
+                    : NULL, z_rows,
+            cols, xin, qkv, z) != 0) {
+        if (mlx4_proj(tl, pi, ps, pb, tr, qkv_rows, cols, xin, qkv) != 0 ||
+            mlx4_proj(tl, zi, zs, zb, tr, z_rows, cols, xin, z) != 0) {
+            return -1;
+        }
+    }
+    if (getenv("DS4F_PROJ_MS")) {
+        static double _pacc = 0; static long _pcnt = 0;
+        _pacc += now_s() - _tproj; _pcnt++;
+        if (_pcnt <= 3 || _pcnt % 100 == 0)
+            fprintf(stderr, "[proj] L%d qkv+z: %.2f ms (avg %.2f)\n",
+                    L, (now_s() - _tproj) * 1e3, _pacc / _pcnt * 1e3);
+    }
+    return lin_body(cfg, tl, L, tr, kv, token, state, qkv, z, buf);
+
+    return 0;
+}
+
+/* CHUNKED prefill variant of linear_step (M1 of prefill-batch):
+ * processes B prompt tokens at layer L together. The qkv+z
+ * projections (the batchable part) run ONCE over the B x-vectors
+ * with the dequant amortized; the serial chain (conv1d ring + delta
+ * state) runs per token via lin_body, in token order, so results are
+ * bit-identical to B sequential linear_step calls. states[B][H] in,
+ * residual-added out. Returns 0 ok, -1 fail (caller falls back). */
+static int linear_step_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
+                             int L, const uint8_t *tr,
+                             float *const *states, int t0, int B,
+                             Ds4fKvCache *kv) {
+    int pi = tl->q3_pqkv[L], ps = tl->q3_pqkvs[L], pb = tl->q3_pqkvb[L];
+    int zi = tl->q3_pz[L], zs = tl->q3_pzs[L], zb = tl->q3_pzb[L];
+    int iln = tl->attn_norm[L];
+    int H = cfg->hidden;
+    int qkv_rows = (int)tl->t[pi].dims[0];      /* 8192 */
+    int z_rows = (int)tl->t[zi].dims[0];        /* 4096 */
+    int cols = (int)tl->t[pi].dims[1] * 8;      /* decoded 2048 = H */
+    if (B < 1) return 0;
+    if (!kv) return -1;
+    if (!kv->lin_alloc)
+        if (ds4f_kv_lin_init(kv, cfg->n_kv_heads > 0 ? cfg->n_kv_heads * 16
+                                                     : 32, 128, 128) != 0)
+            return -1;
+    if (!kv->conv_alloc)
+        if (ds4f_kv_conv_init(kv, qkv_rows) != 0) return -1;
+
+    /* chunk scratch: per token xin[H] + qkv + z, plus the shared
+     * per-token body buffer (lin_body's buf layout:
+     * [xin H][qkv qkv_rows][z z_rows][o o_rows][readout v_heads*vd]
+     * [qk]). B=64 -> ~5.5 MB total, negligible. */
+    int v_heads = cfg->n_kv_heads > 0 ? cfg->n_kv_heads * 16 : 32;
+    long per = (long)H + qkv_rows + z_rows;
+    float *xs = (float *)malloc((size_t)B * (size_t)per * sizeof(float));
+    float *xins = xs;
+    float *qkvs = xins + (size_t)B * H;
+    float *zbtok = qkvs + (size_t)B * qkv_rows;
+    int o_rows = (int)tl->t[tl->q3_opa[L]].dims[0];   /* 2048 = H */
+    long bneed = (long)H + qkv_rows + z_rows + o_rows +
+                 (long)v_heads * 128 + 2 * H + 1;
+    float *bbuf = (float *)malloc((size_t)bneed * sizeof(float));
+    if (!xs || !bbuf) { free(xs); free(bbuf); return -1; }
+
+    /* 1) per-token input_layernorm into xins[B][H] */
+    if (iln >= 0) {
+        const uint16_t *nw = (const uint16_t *)(const void *)(tr +
+                              tl->t[iln].off);
+        for (int b = 0; b < B; b++) {
+            float *xin = xins + (size_t)b * H;
+            memcpy(xin, states[b], (size_t)H * sizeof(float));
+            double ss = 0.0;
+            for (int i = 0; i < H; i++) ss += (double)xin[i] * xin[i];
+            float r = sqrtf((float)(ss / (double)H) + 1e-6f);
+            for (int i = 0; i < H; i++) {
+                uint32_t bits = (uint32_t)nw[i] << 16;
+                float w;
+                memcpy(&w, &bits, 4);
+                xin[i] = xin[i] / r * w;
+            }
+        }
+    } else {
+        for (int b = 0; b < B; b++)
+            memcpy(xins + (size_t)b * H, states[b], (size_t)H * sizeof(float));
+    }
+
+    /* 2) batched qkv + z: dequant once per row, reuse over B tokens */
+    if (ds4f_mlx4_matvec_batch(
+            (const uint32_t *)(const void *)(tr + tl->t[pi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[ps].off),
+            pb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[pb].off)
+                    : NULL,
+            qkv_rows, cols, B, xins, qkvs) != 0 ||
+        ds4f_mlx4_matvec_batch(
+            (const uint32_t *)(const void *)(tr + tl->t[zi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[zs].off),
+            zb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[zb].off)
+                    : NULL,
+            z_rows, cols, B, xins, zbtok) != 0) {
+        free(xs); free(bbuf);
+        return -1;                 /* caller falls back to serial */
+    }
+
+    /* 3) serial per-token body: conv ring + delta state in token order */
+    for (int b = 0; b < B; b++) {
+        float *qkv = qkvs + (size_t)b * qkv_rows;
+        float *z = zbtok + (size_t)b * z_rows;
+        /* bbuf layout: [xin H][qkv][z][o][readout][qk]; lin_body reads
+         * xin from buf (the a/b gates project xin) -- we pass the
+         * token's xin as buf start so the a/b projection is right. */
+        float *bqkv = bbuf + H;
+        float *bz = bqkv + qkv_rows;
+        memcpy(bbuf, xins + (size_t)b * H, (size_t)H * sizeof(float));
+        memcpy(bqkv, qkv, (size_t)qkv_rows * sizeof(float));
+        memcpy(bz, z, (size_t)z_rows * sizeof(float));
+        if (lin_body(cfg, tl, L, tr, kv, t0 + b, states[b], bqkv, bz,
+                     bbuf) != 0) {
+            free(xs); free(bbuf);
+            return -1;
+        }
+    }
+    free(xs); free(bbuf);
     return 0;
 }
 
