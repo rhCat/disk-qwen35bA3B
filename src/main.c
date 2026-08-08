@@ -733,6 +733,16 @@ int main(int argc, char **argv) {
                         "gqa %.2fs rfm %.2fs other %.2fs\n", c0 / CHUNK, B,
                         _tbind, _tattn, _tgqa, _trfm,
                         now_s() - _temb - _tbind - _tattn - _tgqa - _trfm);
+            /* save the LAST prompt token's post-prompt state: the
+             * serial path captures last_tok from its logits (the
+             * first gen token's prediction); the chunk pass skipped
+             * the head, so we need the state to run it once below. */
+            if (c0 + B >= npids) {
+                int lb = npids - 1 - c0;
+                if (lb >= 0 && lb < B)
+                    memcpy(state, pstates + (size_t)lb * stn,
+                           (size_t)stn * sizeof(float));
+            }
             free(pstates); free(xin_b); free(scores_b);
             if (mem_limit_gb > 0.0) {
                 double rss_gb = (double)ds4f_peak_rss() / 1e9;
@@ -744,6 +754,42 @@ int main(int argc, char **argv) {
             }
         }
         fprintf(stderr, "[prefill] chunked pass done, starting gen\n");
+        /* capture the FIRST gen token's prediction from the last
+         * prompt token's logits -- the serial path does this at
+         * t == npids-1 (main.c:1298). The chunk pass saved the last
+         * prompt state into `state`; run the head once here so
+         * last_tok is the model's prediction, not pids[0]. */
+        {
+            const float *hstate_in = state;
+            if (tl.final_norm >= 0) {
+                const uint8_t *trf = ds4f_trunk_bind(&trunk,
+                                                     tl.n_layers - 1);
+                if (trf) {
+                    const Ds4fTrunkTensor *fn = &tl.t[tl.final_norm];
+                    const uint16_t *fnw = (const uint16_t *)(const void *)
+                                          (trf + fn->off);
+                    double ss = 0.0;
+                    for (int i = 0; i < cfg.hidden; i++)
+                        ss += (double)hstate_in[i] * hstate_in[i];
+                    float r = sqrtf((float)(ss / (double)cfg.hidden) + 1e-6f);
+                    for (int i = 0; i < cfg.hidden; i++) {
+                        uint32_t bits = (uint32_t)fnw[i] << 16;
+                        float w;
+                        memcpy(&w, &bits, 4);
+                        xin_buf[i] = hstate_in[i] / r * w;
+                    }
+                    hstate_in = xin_buf;
+                }
+            }
+            if (ds4f_head_logits(&head, hstate_in, logits) != 0) {
+                fprintf(stderr, "head logits failed (chunk last-tok)\n");
+                return 2;
+            }
+            if (getenv("DS4F_GREEDY"))
+                last_tok = ds4f_argmax(logits, (int)head.dims[0]);
+            else
+                last_tok = ds4f_sample(logits, (int)head.dims[0], &rng);
+        }
     }
     /* prompt pass + generation: the first npids iterations feed the
      * prompt tokens (no sampling, no output) so the KV/state caches

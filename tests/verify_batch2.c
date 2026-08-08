@@ -1,8 +1,10 @@
-/* verify_batch2.c -- the batched kernel must match the SCALAR
- * reference exactly (same c-order accumulation). The SIMD matvec
- * uses an 8-accumulator tree so it differs by float32 rounding; the
- * scalar path is the true bit-fidelity anchor. */
+/* verify_batch2.c -- the batch kernel must be BIT-IDENTICAL to the
+ * engine's ds4f_simd_mlx4_matvec per (row, token): same 8-accumulator
+ * topology, same (c>>2)&7 map, same reduction order. This is the
+ * real reference (the earlier scalar-ref test certified the same
+ * wrong group indexing as the kernel -- self-consistent but wrong). */
 #include "ds4f/kernels.h"
+#include "ds4f/simd.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,29 +14,6 @@ static unsigned g_rng = 0x12345678u;
 static unsigned rnd(void) {
     g_rng = g_rng * 1664525u + 1013904223u;
     return g_rng;
-}
-
-/* scalar mlx4 matvec, one token: bit-fidelity anchor. Group index is
- * ABSOLUTE across the R*C matrix ((r*C+c)/64) -- matches the engine's
- * ds4f_simd_mlx4_matvec (simd.c:158), NOT per-row c/64. */
-static void ref_scalar(const uint32_t *vals, const uint16_t *scales,
-                       const uint16_t *biases, int R, int C,
-                       const float *x, float *y) {
-    for (int r = 0; r < R; r++) {
-        float acc = 0.0f;
-        for (int c = 0; c < C; c++) {
-            int g = (int)(((size_t)r * C + c) / DS4F_MLX4_GROUP);
-            uint32_t sb = (uint32_t)scales[g] << 16;
-            uint32_t bb = biases ? (uint32_t)biases[g] << 16 : 0;
-            float s, b;
-            memcpy(&s, &sb, 4);
-            memcpy(&b, &bb, 4);
-            int q = (int)((vals[(size_t)r * (C / 8) + (c >> 3)] >>
-                           (4 * (c & 7))) & 0xFu);
-            acc += ((float)q * s + b) * x[c];
-        }
-        y[r] = acc;
-    }
 }
 
 int main(void) {
@@ -49,32 +28,32 @@ int main(void) {
         scales[i] = (uint16_t)(0x3F80 + (rnd() % 64));
         biases[i] = (uint16_t)(0x3F80 + (rnd() % 64));
     }
-    float *xs = (float *)malloc((size_t)B * C * 4);   /* [C][B] col-major */
-    float *xsr = (float *)malloc((size_t)B * C * 4);  /* row-major copy */
+    /* xs: ROW-MAJOR [B][C] (the batch kernel's layout) */
+    float *xs = (float *)malloc((size_t)B * C * 4);
     for (int t = 0; t < B; t++)
         for (int c = 0; c < C; c++)
-            xsr[(size_t)t * C + c] = (float)(rnd() % 100) / 100.0f;
-    for (int c = 0; c < C; c++)
-        for (int t = 0; t < B; t++)
-            xs[(size_t)c * B + t] = xsr[(size_t)t * C + c];
+            xs[(size_t)t * C + c] = (float)(rnd() % 100) / 100.0f;
+    /* reference: the ENGINE's SIMD matvec, one token at a time */
     float *ref = (float *)malloc((size_t)B * R * 4);
     float *got = (float *)malloc((size_t)B * R * 4);
     for (int t = 0; t < B; t++)
-        ref_scalar(vals, scales, biases, R, C, xsr + (size_t)t * C,
-                   ref + (size_t)t * R);
+        ds4f_simd_mlx4_matvec(vals, scales, biases, R, C,
+                              xs + (size_t)t * C, ref + (size_t)t * R,
+                              0, R);
     if (ds4f_mlx4_matvec_batch(vals, scales, biases, R, C, B, xs, got) != 0) {
         printf("batch returned -1\n");
         return 1;
     }
     int bad = 0;
-    for (size_t i = 0; i < (size_t)B * R; i++)
+    for (size_t i = 0; i < (size_t)B * R; i++) {
         if (got[i] != ref[i]) {
             if (bad < 3)
                 printf("MISMATCH at %zu: got %.9g ref %.9g\n", i, got[i], ref[i]);
             bad++;
         }
+    }
     if (bad == 0)
-        printf("BIT-IDENTICAL to scalar: %d tokens x %d rows\n", B, R);
+        printf("BIT-IDENTICAL to engine SIMD matvec: %d tokens x %d rows\n", B, R);
     else
         printf("FAIL: %d mismatches\n", bad);
     return bad == 0 ? 0 : 1;

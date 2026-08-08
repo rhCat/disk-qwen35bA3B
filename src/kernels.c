@@ -447,77 +447,133 @@ int ds4f_mlx4_matvec2(const uint32_t *v1, const uint16_t *s1,
 }
 
 /* ---- batched prefill matvec (M1 of prefill-batch) ---------------- */
-/* Y[B][R] = W[R x C] * X, where X is COLUMN-MAJOR [C][B] (tokens
- * contiguous per column -- the GEMM layout, so the inner loop reads
- * a contiguous B-float block). The 4-bit dequant is done ONCE per
- * weight row and reused across the B token vectors -- the prefill
- * win. Bit-identical per (row, token) to ds4f_mlx4_matvec (same
- * accumulation order, same FMA), so e2e traces hold. */
+/* Y[B][R] = W[R x C] * X, where X is ROW-MAJOR [B][C] (each token's
+ * row contiguous -- the layout the per-token SIMD FMA loop needs).
+ * The 4-bit row is decoded ONCE (dequant amortized over the B token
+ * vectors), then each token runs the EXACT ds4f_simd_mlx4_matvec
+ * accumulation topology: 8 vector accumulators with the (c>>2)&7
+ * column map, same FMA chains, same reduction order -- so results
+ * are BIT-IDENTICAL per (row, token) to the serial SIMD matvec, not
+ * merely close. The recurrent delta-rule state amplifies any 1-ULP
+ * difference into divergent generation; this preserves the map. */
 typedef struct {
     const uint32_t *vals; const uint16_t *scales, *biases;
     int R, C, B;
-    const float *xs;   /* B x C, row-major per token */
-    float *ys;         /* B x R, row-major per token */
+    const float *xs;   /* [B][C] row-major */
+    float *ys;         /* [B][R] row-major */
     int r0, r1;        /* row range [r0, r1) of W */
 } Mlx4BatchJob;
 
 static void *mlx4_batch_worker(void *arg) {
     Mlx4BatchJob *j = (Mlx4BatchJob *)arg;
-    const int C = j->C;
-    int B = j->B;
-    /* per-token accumulators in registers: ys[t*R+r] scattered writes
-     * (32KB stride) were the pathology -- ~1GB of scattered stores per
-     * matvec. Accumulate in a local array, write ys once per row. */
-    float acc[512];
-    if (B > 512) B = 512;
+    const int C = j->C, B = j->B;
+    /* decoded row scratch (per worker): C floats, grown on demand */
+    static __thread float *trow = NULL;
+    static __thread size_t trow_cap = 0;
+    if ((size_t)C > trow_cap) {
+        float *nb = (float *)realloc(trow, (size_t)C * sizeof(float));
+        if (!nb) return NULL;
+        trow = nb; trow_cap = (size_t)C;
+    }
+    float *wrow = trow;
     for (int r = j->r0; r < j->r1; r++) {
-        /* decode this row ONCE: 16-entry LUT per 64-group. The group
-         * index is ABSOLUTE across the R*C matrix -- (r*C+c)/64 --
-         * exactly like ds4f_simd_mlx4_matvec (simd.c:158). For rows
-         * with C%64==0 this is r*(C/64) + c/64; using per-row c/64
-         * reads ROW 0's scales for every row (a 2x z-rms divergence
-         * that compounding through the delta-rule state completely
-         * derailed generation). */
-        float lut[16];
-        int gcur = -1;
-        long rbase = (long)r * C;
-        for (int t = 0; t < B; t++) acc[t] = 0.0f;
-        for (int c = 0; c < C; c++) {
-            int g = (int)((rbase + c) / DS4F_MLX4_GROUP);
-            if (g != gcur) {
-                gcur = g;
-                uint32_t sb = (uint32_t)j->scales[g] << 16;
-                uint32_t bb = j->biases ? (uint32_t)j->biases[g] << 16 : 0;
-                float s, b;
-                memcpy(&s, &sb, 4);
-                memcpy(&b, &bb, 4);
-                for (int q = 0; q < 16; q++) lut[q] = (float)q * s + b;
-            }
-            int q = (int)((j->vals[(size_t)r * (C / 8) + (c >> 3)] >>
-                           (4 * (c & 7))) & 0xFu);
-            float w = lut[q];
-            /* xs is [C][B]: tokens contiguous per column */
-            const float *xcol = j->xs + (size_t)c * B;
-#ifdef __aarch64__
-            if (ds4f_kernels_simd()) {
-                /* NEON: 4 tokens in parallel. Each acc[t] keeps the
-                 * SAME c-order accumulation as the scalar loop and
-                 * vmlaq matches -O2 fp-contract, so per-token results
-                 * are bit-identical to the scalar reference. */
-                int t = 0;
-                for (; t + 4 <= B; t += 4) {
-                    float32x4_t av = vld1q_f32(acc + t);
-                    float32x4_t xv = vld1q_f32(xcol + t);
-                    vst1q_f32(acc + t, vmlaq_n_f32(av, xv, w));
-                }
-                for (; t < B; t++) acc[t] += w * xcol[t];
-            } else
-#endif
-            for (int t = 0; t < B; t++)
-                acc[t] += w * xcol[t];
+        /* decode this row ONCE. Group index ABSOLUTE across R*C
+         * ((r*C+c)/64), exactly like simd.c:158 -- per-row c/64
+         * reads row 0's scales (the divergence bug). */
+        const uint32_t *vr = j->vals + (size_t)r * (C / 8);
+        int ng = (C + DS4F_MLX4_GROUP - 1) / DS4F_MLX4_GROUP;
+        float srow[64], brow[64];
+        for (int g = 0; g < ng && g < 64; g++) {
+            size_t absg = ((size_t)r * C + (size_t)g * DS4F_MLX4_GROUP)
+                          / DS4F_MLX4_GROUP;
+            uint32_t sb = (uint32_t)j->scales[absg] << 16;
+            uint32_t bb = j->biases ? (uint32_t)j->biases[absg] << 16 : 0;
+            memcpy(&srow[g], &sb, 4);
+            memcpy(&brow[g], &bb, 4);
         }
-        for (int t = 0; t < B; t++)
-            j->ys[(size_t)t * j->R + r] = acc[t];
+#ifdef __aarch64__
+        if (ds4f_kernels_simd()) {
+            /* vector decode into wrow: same FMA per element as the
+             * serial kernel's d0..d3 (bv + q*sv), stored once */
+            int c = 0, w = 0;
+            for (; c + 15 < C; c += 16, w += 2) {
+                int g = c / DS4F_MLX4_GROUP;
+                float32x4_t sv = vdupq_n_f32(srow[g]);
+                float32x4_t bv = vdupq_n_f32(brow[g]);
+                uint32_t u0 = vr[w], u1 = vr[w + 1];
+                uint8x8_t b0 = vreinterpret_u8_u32(vdup_n_u32(u0));
+                uint8x8_t b1 = vreinterpret_u8_u32(vdup_n_u32(u1));
+                uint8x8_t lo0 = vand_u8(b0, vdup_n_u8(0x0F));
+                uint8x8_t hi0 = vand_u8(vshr_n_u8(b0, 4), vdup_n_u8(0x0F));
+                uint8x8_t lo1 = vand_u8(b1, vdup_n_u8(0x0F));
+                uint8x8_t hi1 = vand_u8(vshr_n_u8(b1, 4), vdup_n_u8(0x0F));
+                uint8x8_t n0 = vzip_u8(lo0, hi0).val[0];
+                uint8x8_t n1 = vzip_u8(lo1, hi1).val[0];
+                uint32x4_t q00 = vmovl_u16(vget_low_u16(vmovl_u8(n0)));
+                uint32x4_t q01 = vmovl_u16(vget_high_u16(vmovl_u8(n0)));
+                uint32x4_t q10 = vmovl_u16(vget_low_u16(vmovl_u8(n1)));
+                uint32x4_t q11 = vmovl_u16(vget_high_u16(vmovl_u8(n1)));
+                vst1q_f32(wrow + c,     vmlaq_f32(bv, vcvtq_f32_u32(q00), sv));
+                vst1q_f32(wrow + c + 4, vmlaq_f32(bv, vcvtq_f32_u32(q01), sv));
+                vst1q_f32(wrow + c + 8, vmlaq_f32(bv, vcvtq_f32_u32(q10), sv));
+                vst1q_f32(wrow + c + 12, vmlaq_f32(bv, vcvtq_f32_u32(q11), sv));
+            }
+            /* scalar tail decode (C % 16 != 0) */
+            for (; c < C; c++) {
+                long k = (size_t)r * C + c;
+                int gl = (int)((c) / DS4F_MLX4_GROUP);
+                long wl = (k - (size_t)r * C) >> 3;
+                int q = (int)((vr[wl] >> (4 * (k & 7))) & 0xFu);
+                wrow[c] = (float)q * srow[gl] + brow[gl];
+            }
+            /* per-token FMA: the EXACT serial topology -- 8 vector
+             * accumulators, (c>>2)&7 map, same reduction order */
+            for (int t = 0; t < B; t++) {
+                const float *xt = j->xs + (size_t)t * C;
+                float32x4_t acc[8];
+                for (int a = 0; a < 8; a++) acc[a] = vdupq_n_f32(0.0f);
+                int c = 0;
+                for (; c + 15 < C; c += 16) {
+                    int ab = (c >> 2) & 7;   /* 0 or 4 for c%16==0 */
+                    acc[ab + 0] = vmlaq_f32(acc[ab + 0],
+                                            vld1q_f32(wrow + c),
+                                            vld1q_f32(xt + c));
+                    acc[ab + 1] = vmlaq_f32(acc[ab + 1],
+                                            vld1q_f32(wrow + c + 4),
+                                            vld1q_f32(xt + c + 4));
+                    acc[ab + 2] = vmlaq_f32(acc[ab + 2],
+                                            vld1q_f32(wrow + c + 8),
+                                            vld1q_f32(xt + c + 8));
+                    acc[ab + 3] = vmlaq_f32(acc[ab + 3],
+                                            vld1q_f32(wrow + c + 12),
+                                            vld1q_f32(xt + c + 12));
+                }
+                float32x4_t s4 = vdupq_n_f32(0.0f);
+                for (int a = 0; a < 8; a++) s4 = vaddq_f32(s4, acc[a]);
+                float32x2_t tt = vadd_f32(vget_low_f32(s4),
+                                          vget_high_f32(s4));
+                float s = vget_lane_f32(tt, 0) + vget_lane_f32(tt, 1);
+                for (; c < C; c++) s += wrow[c] * xt[c];  /* tail */
+                j->ys[(size_t)t * j->R + r] = s;
+            }
+        } else
+#endif
+        {
+            /* scalar fallback: decode wrow scalar, c-order accumulate */
+            for (int c = 0; c < C; c++) {
+                long k = (size_t)r * C + c;
+                int gl = (int)(k / DS4F_MLX4_GROUP);
+                long wl = (k - (size_t)r * C) >> 3;
+                int q = (int)((vr[wl] >> (4 * (k & 7))) & 0xFu);
+                wrow[c] = (float)q * srow[gl] + brow[gl];
+            }
+            for (int t = 0; t < B; t++) {
+                const float *xt = j->xs + (size_t)t * C;
+                float s = 0.0f;
+                for (int c = 0; c < C; c++) s += wrow[c] * xt[c];
+                j->ys[(size_t)t * j->R + r] = s;
+            }
+        }
     }
     return NULL;
 }
@@ -528,8 +584,6 @@ int ds4f_mlx4_matvec_batch(const uint32_t *vals, const uint16_t *scales,
     if (!ds4f_kernels_simd() || (C % 8) != 0 || R < 1 || B < 1)
         return -1;
     if (ds4f_kernels_in_expert()) return -1;
-    /* zero the outputs (the worker ACCUMULATES into ys) */
-    memset(ys, 0, (size_t)B * R * sizeof(float));
     int nth = 8;
     const char *env = getenv("DS4F_ATTN_THREADS");
     if (env) {

@@ -942,6 +942,8 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
     int cols = (int)tl->t[pi].dims[1] * 8;      /* decoded 2048 = H */
     if (B < 1) return 0;
     if (!kv) return -1;
+    double _tch = now_s();
+    static double _chk_acc[4] = {0,0,0,0}; static long _chk_n = 0;
     if (!kv->lin_alloc)
         if (ds4f_kv_lin_init(kv, cfg->n_kv_heads > 0 ? cfg->n_kv_heads * 16
                                                      : 32, 128, 128) != 0)
@@ -952,39 +954,43 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
     /* chunk scratch: per token xin[H] + qkv + z, plus the shared
      * per-token body buffer (lin_body's buf layout:
      * [xin H][qkv qkv_rows][z z_rows][o o_rows][readout v_heads*vd]
-     * [qk]). B=64 -> ~5.5 MB total, negligible. */
+     * [qk]). B=64 -> ~5.5 MB total, negligible. The batch matvec
+     * takes xins as ROW-MAJOR [B][H] (per-token rows contiguous --
+     * the layout the bit-identical SIMD FMA loop needs); qkvs/zbtok
+     * are [B][rows] row-major for the serial lin_body feed. */
     int v_heads = cfg->n_kv_heads > 0 ? cfg->n_kv_heads * 16 : 32;
     long per = (long)H + qkv_rows + z_rows;
     float *xs = (float *)malloc((size_t)B * (size_t)per * sizeof(float));
-    float *xins = xs;
-    float *qkvs = xins + (size_t)B * H;
-    float *zbtok = qkvs + (size_t)B * qkv_rows;
+    float *xins = xs;                       /* [B][H] row-major */
+    float *qkvs = xins + (size_t)B * H;     /* [B][qkv_rows] row-major */
+    float *zbtok = qkvs + (size_t)B * qkv_rows;  /* [B][z_rows] */
     int o_rows = (int)tl->t[tl->q3_opa[L]].dims[0];   /* 2048 = H */
     long bneed = (long)H + qkv_rows + z_rows + o_rows +
                  (long)v_heads * 128 + 2 * H + 1;
     float *bbuf = (float *)malloc((size_t)bneed * sizeof(float));
     if (!xs || !bbuf) { free(xs); free(bbuf); return -1; }
 
-    /* 1) per-token input_layernorm into xins[B][H] */
+    /* 1) per-token input_layernorm into xins[B][H] (row-major) */
     if (iln >= 0) {
         const uint16_t *nw = (const uint16_t *)(const void *)(tr +
                               tl->t[iln].off);
         for (int b = 0; b < B; b++) {
+            const float *st = states[b];
             float *xin = xins + (size_t)b * H;
-            memcpy(xin, states[b], (size_t)H * sizeof(float));
             double ss = 0.0;
-            for (int i = 0; i < H; i++) ss += (double)xin[i] * xin[i];
+            for (int i = 0; i < H; i++) ss += (double)st[i] * st[i];
             float r = sqrtf((float)(ss / (double)H) + 1e-6f);
             for (int i = 0; i < H; i++) {
                 uint32_t bits = (uint32_t)nw[i] << 16;
                 float w;
                 memcpy(&w, &bits, 4);
-                xin[i] = xin[i] / r * w;
+                xin[i] = st[i] / r * w;
             }
         }
     } else {
         for (int b = 0; b < B; b++)
-            memcpy(xins + (size_t)b * H, states[b], (size_t)H * sizeof(float));
+            memcpy(xins + (size_t)b * H, states[b],
+                   (size_t)H * sizeof(float));
     }
 
     /* 2) batched qkv + z: dequant once per row, reuse over B tokens */
@@ -1022,6 +1028,10 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
             return -1;
         }
     }
+    _chk_acc[0] += now_s() - _tch; _chk_n++;
+    if (_chk_n <= 40 || _chk_n % 80 == 0)
+        fprintf(stderr, "[chunk] L%d B=%d total %.2f ms (avg %.2f)\n",
+                L, B, (now_s() - _tch) * 1e3, _chk_acc[0] / _chk_n * 1e3);
     free(xs); free(bbuf);
     return 0;
 }
