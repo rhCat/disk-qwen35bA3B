@@ -1,6 +1,7 @@
 /* moe.c -- layout loaders + real MoE compute step. */
 #include "ds4f/moe.h"
 #include "ds4f/kernels.h"
+#include "ds4f/gpu.h"
 #include "json.h"
 
 #include <math.h>
@@ -1047,6 +1048,107 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     pthread_t th[64];
     ExpJob job[64];
     int njob = 0;
+    if (getenv("DS4F_GPU") && *getenv("DS4F_GPU") && *getenv("DS4F_GPU") != '0') {
+        /* GPU batched path (the 13x design): gate+up batched in ONE
+         * dispatch (2*topk jobs of R=M), silu*up on CPU, then the downs
+         * batched (topk jobs of R=H). Falls back to the CPU path on any
+         * failure (Metal unavailable / arena full / OOM). */
+        static int64_t _gpu_layers = 0, _gpu_fb = 0;
+        const char *dbg = getenv("DS4F_GPU_DIAG");
+        const uint32_t *gv[128], *uv[128], *dv[128];
+        const uint16_t *gs[128], *us[128], *ds_[128];
+        const uint16_t *gb[128], *ub[128], *db[128];
+        float *gy[128], *uy[128], *dy[128];
+        const float *xlat[128], *xchain[128];
+        const void *idg[128], *idu[128], *idd[128];
+        int nexp = 0;
+        for (int j = 0; j < cfg->topk; j++) {
+            if (!es[j]) continue;
+            const Ds4fExpertLayout *el = &pl->exp[(size_t)L * pl->n_experts + sel[j]];
+            const Ds4fMoETensor *g = &el->t[0], *u = &el->t[1], *d = &el->t[2];
+            if (g->rank != 2 || u->rank != 2 || d->rank != 2 ||
+                g->rel_v < 0 || g->rel_s < 0 || u->rel_v < 0 || u->rel_s < 0 ||
+                d->rel_v < 0 || d->rel_s < 0) {
+                goto gpu_fallback;
+            }
+            ExpJob *jb = &job[nexp];
+            gv[nexp] = (const uint32_t *)(const void *)(es[j] + g->rel_v);
+            gs[nexp] = (const uint16_t *)(const void *)(es[j] + g->rel_s);
+            gb[nexp] = g->rel_b >= 0
+                ? (const uint16_t *)(const void *)(es[j] + g->rel_b) : NULL;
+            uv[nexp] = (const uint32_t *)(const void *)(es[j] + u->rel_v);
+            us[nexp] = (const uint16_t *)(const void *)(es[j] + u->rel_s);
+            ub[nexp] = u->rel_b >= 0
+                ? (const uint16_t *)(const void *)(es[j] + u->rel_b) : NULL;
+            dv[nexp] = (const uint32_t *)(const void *)(es[j] + d->rel_v);
+            ds_[nexp] = (const uint16_t *)(const void *)(es[j] + d->rel_s);
+            db[nexp] = d->rel_b >= 0
+                ? (const uint16_t *)(const void *)(es[j] + d->rel_b) : NULL;
+            idg[nexp] = g; idu[nexp] = u; idd[nexp] = d;   /* stable */
+            jb->out = jobbuf + (size_t)nexp * (size_t)perjob;
+            gy[nexp] = jb->out;                       /* gate: M floats */
+            uy[nexp] = jb->out + M;                   /* up: M floats */
+            dy[nexp] = jb->out + 2 * M;               /* down: H floats */
+            xlat[nexp] = latent;
+            nexp++;
+        }
+        if (nexp > 0 && ds4f_gpu_init() == 0) {
+            int rc = 0;
+            /* dispatch 1: gate+up, 2*nexp jobs of R=M, x=latent */
+            const uint32_t *v1[256]; const uint16_t *s1[256], *b1[256];
+            const float *x1[256]; float *y1[256]; const void *id1[256];
+            for (int e = 0; e < nexp; e++) {
+                v1[2*e] = gv[e]; s1[2*e] = gs[e]; b1[2*e] = gb[e];
+                x1[2*e] = xlat[e]; y1[2*e] = gy[e]; id1[2*e] = idg[e];
+                v1[2*e+1] = uv[e]; s1[2*e+1] = us[e]; b1[2*e+1] = ub[e];
+                x1[2*e+1] = xlat[e]; y1[2*e+1] = uy[e]; id1[2*e+1] = idu[e];
+            }
+            rc = ds4f_gpu_mlx4_batch(v1, s1, b1, x1, y1, id1, (int)M, (int)H, 2*nexp);
+            if (rc == 0) {
+                /* silu(gate)*up on CPU: chain lands in uy (up consumed) */
+                for (int e = 0; e < nexp; e++) {
+                    float *gx = gy[e], *ux = uy[e];
+                    for (int i = 0; i < M; i++) {
+                        float s = gx[i];
+                        float sig = 1.0f / (1.0f + expf(-s));
+                        ux[i] = s * sig * ux[i];
+                    }
+                    xchain[e] = uy[e];
+                }
+                /* dispatch 2: downs, nexp jobs of R=H, x=chain per job */
+                const float *x2[256]; float *y2[256]; const void *id2[256];
+                for (int e = 0; e < nexp; e++) {
+                    v1[e] = dv[e]; s1[e] = ds_[e]; b1[e] = db[e];
+                    x2[e] = xchain[e]; y2[e] = dy[e]; id2[e] = idd[e];
+                }
+                rc = ds4f_gpu_mlx4_batch(v1, s1, b1, x2, y2, id2, (int)H, (int)M, nexp);
+                if (rc == 0) {
+                    /* the combine reads jb->out[0..Lat): the down result
+                     * (H floats) lives at dy = jb->out + 2*M, so move it
+                     * into jb->out (H <= Lat). */
+                    for (int e = 0; e < nexp; e++) {
+                        memmove(job[e].out, dy[e], (size_t)H * sizeof(float));
+                        job[e].n_matvec = 3;
+                        job[e].n_decode = (int64_t)(M * H + M * H + H * M);
+                        job[e].fail = 0;
+                    }
+                    njob = nexp;
+                    _gpu_layers++;
+                    if (dbg && (_gpu_layers % 200 == 0 || _gpu_layers < 5))
+                        fprintf(stderr, "[gpu] L%d used GPU (%lld layers, %lld fb)\n",
+                                L, (long long)_gpu_layers, (long long)_gpu_fb);
+                    goto gpu_combined;
+                }
+            }
+        }
+        _gpu_fb++;
+        if (dbg && (_gpu_fb % 200 == 0 || _gpu_fb < 5))
+            fprintf(stderr, "[gpu] L%d FELL BACK to CPU (%lld layers, %lld fb)\n",
+                    L, (long long)_gpu_layers, (long long)_gpu_fb);
+    gpu_fallback:
+        /* CPU path below */
+        ;
+    }
     for (int j = 0; j < cfg->topk; j++) {
         if (!es[j]) continue;
         ExpJob *jb = &job[njob];
@@ -1087,6 +1189,7 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         *n_matvec += jb->n_matvec;
         *n_decode += jb->n_decode;
     }
+gpu_combined:
     /* combine in selection order: acc[i] += wsel[sel order] * chain[i] */
     {
         int sj = 0;
