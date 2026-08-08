@@ -442,3 +442,86 @@ int ds4f_mlx4_matvec2(const uint32_t *v1, const uint16_t *s1,
         pthread_join(th[t], NULL);
     return 0;
 }
+
+/* ---- batched prefill matvec (M1 of prefill-batch) ---------------- */
+/* Y[B][R] = W[R x C] * X[B][C]. The 4-bit dequant is done ONCE per
+ * weight row and reused across the B token vectors -- the prefill
+ * win. Bit-identical per (row, token) to ds4f_mlx4_matvec (same
+ * accumulation order, same FMA), so e2e traces hold. */
+typedef struct {
+    const uint32_t *vals; const uint16_t *scales, *biases;
+    int R, C, B;
+    const float *xs;   /* B x C, row-major per token */
+    float *ys;         /* B x R, row-major per token */
+    int r0, r1;        /* row range [r0, r1) of W */
+} Mlx4BatchJob;
+
+static void *mlx4_batch_worker(void *arg) {
+    Mlx4BatchJob *j = (Mlx4BatchJob *)arg;
+    const int C = j->C, B = j->B;
+    for (int r = j->r0; r < j->r1; r++) {
+        /* decode this row ONCE: 16-entry LUT per 64-group */
+        float lut[16];
+        int gcur = -1;
+        for (int c = 0; c < C; c++) {
+            int g = c / DS4F_MLX4_GROUP;
+            if (g != gcur) {
+                gcur = g;
+                uint32_t sb = (uint32_t)j->scales[g] << 16;
+                uint32_t bb = j->biases ? (uint32_t)j->biases[g] << 16 : 0;
+                float s, b;
+                memcpy(&s, &sb, 4);
+                memcpy(&b, &bb, 4);
+                for (int q = 0; q < 16; q++) lut[q] = (float)q * s + b;
+            }
+            int q = (int)((j->vals[(size_t)r * (C / 8) + (c >> 3)] >>
+                           (4 * (c & 7))) & 0xFu);
+            float w = lut[q];
+            for (int t = 0; t < B; t++)
+                j->ys[(size_t)t * j->R + r] += w * j->xs[(size_t)t * C + c];
+        }
+    }
+    return NULL;
+}
+
+int ds4f_mlx4_matvec_batch(const uint32_t *vals, const uint16_t *scales,
+                           const uint16_t *biases, int R, int C, int B,
+                           const float *xs, float *ys) {
+    if (!ds4f_kernels_simd() || (C % 8) != 0 || R < 1 || B < 1)
+        return -1;
+    if (ds4f_kernels_in_expert()) return -1;
+    /* zero the outputs (the worker ACCUMULATES into ys) */
+    memset(ys, 0, (size_t)B * R * sizeof(float));
+    int nth = 8;
+    const char *env = getenv("DS4F_ATTN_THREADS");
+    if (env) {
+        int v = atoi(env);
+        if (v >= 1 && v <= 32) nth = v;
+    }
+    if (nth < 2 || R < nth) {
+        Mlx4BatchJob j;
+        j.vals = vals; j.scales = scales; j.biases = biases;
+        j.R = R; j.C = C; j.B = B; j.xs = xs; j.ys = ys;
+        j.r0 = 0; j.r1 = R;
+        mlx4_batch_worker(&j);
+        return 0;
+    }
+    int chunk = (R + nth - 1) / nth;
+    pthread_t th[32];
+    Mlx4BatchJob job[32];
+    int nspawn = 0;
+    for (int t = 0; t < nth; t++) {
+        int r0 = t * chunk;
+        int r1 = (t + 1) * chunk < R ? (t + 1) * chunk : R;
+        if (r0 >= R) continue;
+        job[t].vals = vals; job[t].scales = scales; job[t].biases = biases;
+        job[t].R = R; job[t].C = C; job[t].B = B;
+        job[t].xs = xs; job[t].ys = ys;
+        job[t].r0 = r0; job[t].r1 = r1;
+        pthread_create(&th[t], NULL, mlx4_batch_worker, &job[t]);
+        nspawn++;
+    }
+    for (int t = 0; t < nspawn; t++)
+        pthread_join(th[t], NULL);
+    return 0;
+}
