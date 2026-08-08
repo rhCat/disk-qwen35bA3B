@@ -10,3 +10,4 @@ fixture/
 *.dSYM/
 .venv/
 *.log
+bench-gpu-experts
