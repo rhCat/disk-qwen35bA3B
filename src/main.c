@@ -607,13 +607,18 @@ int main(int argc, char **argv) {
             }
             /* layer-major: one trunk pass per chunk */
             ds4f_trunk_rewind(&trunk);
+            double _temb = now_s(), _tbind = 0.0, _tgqa = 0.0, _tattn = 0.0;
+            double _trfm = 0.0;
             for (int L = 0; L < cfg.n_layers; L++) {
+                double _tb0 = now_s();
                 const uint8_t *tr = ds4f_trunk_bind(&trunk, L);
+                _tbind += now_s() - _tb0;
                 if (!tr) { fprintf(stderr, "trunk bind failed at L%d\n", L); return 2; }
                 int use_real = tl.gate[L] >= 0;
                 /* attention: linear layers batched, gqa serial */
                 if (use_real && kv_ok && !getenv("DS4F_SKIP_ATTN")) {
                     int q3_layer = (tl.q3_q[L] >= 0) || (tl.q3_conv[L] >= 0);
+                    double _ta0 = now_s();
                     if (q3_layer && tl.q3_conv[L] >= 0) {
                         /* batch the linear layer over the chunk */
                         for (int b = 0; b < B; b++) ps_arr[b] = pstates +
@@ -624,12 +629,14 @@ int main(int argc, char **argv) {
                             return 2;
                         }
                     } else if (q3_layer) {
+                        double _tg0 = now_s();
                         for (int b = 0; b < B; b++) {
                             float *st = pstates + (size_t)b * stn;
                             if (ds4f_attn_qwen_step(&cfg, &tl, L, tr, st,
                                                     &kvc, c0 + b) != 0)
                                 return 2;
                         }
+                        _tgqa += now_s() - _tg0;
                     } else {
                         for (int b = 0; b < B; b++) {
                             float *st = pstates + (size_t)b * stn;
@@ -638,6 +645,7 @@ int main(int argc, char **argv) {
                                 return 2;
                         }
                     }
+                    _tattn += now_s() - _ta0;
                 }
                 /* M2 batched rfm measured SLOWER than serial at B=64
                  * (249-330ms/layer vs 134-167ms: routing diversity
@@ -714,10 +722,17 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                if (getenv("DS4F_CHUNK_MS"))
+                if (getenv("DS4F_CHUNK_MS")) {
                     fprintf(stderr, "[chunk-moe] L%d B=%d rfm %.2f ms\n", L, B,
                             (now_s() - _tf0) * 1e3);
+                    _trfm += now_s() - _tf0;
+                }
             }
+            if (getenv("DS4F_CHUNK_MS"))
+                fprintf(stderr, "[chunk-sum] c%d B=%d bind %.2fs attn %.2fs "
+                        "gqa %.2fs rfm %.2fs other %.2fs\n", c0 / CHUNK, B,
+                        _tbind, _tattn, _tgqa, _trfm,
+                        now_s() - _temb - _tbind - _tattn - _tgqa - _trfm);
             free(pstates); free(xin_b); free(scores_b);
             if (mem_limit_gb > 0.0) {
                 double rss_gb = (double)ds4f_peak_rss() / 1e9;
@@ -732,10 +747,16 @@ int main(int argc, char **argv) {
     }
     /* prompt pass + generation: the first npids iterations feed the
      * prompt tokens (no sampling, no output) so the KV/state caches
-     * see the whole context; the next gen iterations generate. */
+     * see the whole context; the next gen iterations generate.
+     * When the chunked prefill ran, it already filled the KV cache
+     * for the whole prompt -- the loop starts at t=npids (generation
+     * only) so the prompt is NOT re-processed serially. */
+    int t_start = 0;
+    if (pc && *pc == '1' && text_mode && npids > 1 && moe_mode)
+        t_start = npids;          /* chunked prefill did the prompt */
     int total_toks = npids + gen;
     int in_think = 0;            /* DS4F_STRIP_THINK state (opt-in) */
-    for (int t = 0; t < total_toks; t++) {
+    for (int t = t_start; t < total_toks; t++) {
         int gen_t = t - npids;       /* >= 0 once past the prompt */
         if (getenv("DS4F_TIME_LAYERS")) {
             static double tL0 = 0.0;

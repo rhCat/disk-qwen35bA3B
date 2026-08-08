@@ -14,14 +14,16 @@ static unsigned rnd(void) {
     return g_rng;
 }
 
-/* scalar mlx4 matvec, one token: bit-fidelity anchor */
+/* scalar mlx4 matvec, one token: bit-fidelity anchor. Group index is
+ * ABSOLUTE across the R*C matrix ((r*C+c)/64) -- matches the engine's
+ * ds4f_simd_mlx4_matvec (simd.c:158), NOT per-row c/64. */
 static void ref_scalar(const uint32_t *vals, const uint16_t *scales,
                        const uint16_t *biases, int R, int C,
                        const float *x, float *y) {
     for (int r = 0; r < R; r++) {
         float acc = 0.0f;
         for (int c = 0; c < C; c++) {
-            int g = c / DS4F_MLX4_GROUP;
+            int g = (int)(((size_t)r * C + c) / DS4F_MLX4_GROUP);
             uint32_t sb = (uint32_t)scales[g] << 16;
             uint32_t bb = biases ? (uint32_t)biases[g] << 16 : 0;
             float s, b;
@@ -47,14 +49,18 @@ int main(void) {
         scales[i] = (uint16_t)(0x3F80 + (rnd() % 64));
         biases[i] = (uint16_t)(0x3F80 + (rnd() % 64));
     }
-    float *xs = (float *)malloc((size_t)B * C * 4);
+    float *xs = (float *)malloc((size_t)B * C * 4);   /* [C][B] col-major */
+    float *xsr = (float *)malloc((size_t)B * C * 4);  /* row-major copy */
     for (int t = 0; t < B; t++)
         for (int c = 0; c < C; c++)
-            xs[(size_t)t * C + c] = (float)(rnd() % 100) / 100.0f;
+            xsr[(size_t)t * C + c] = (float)(rnd() % 100) / 100.0f;
+    for (int c = 0; c < C; c++)
+        for (int t = 0; t < B; t++)
+            xs[(size_t)c * B + t] = xsr[(size_t)t * C + c];
     float *ref = (float *)malloc((size_t)B * R * 4);
     float *got = (float *)malloc((size_t)B * R * 4);
     for (int t = 0; t < B; t++)
-        ref_scalar(vals, scales, biases, R, C, xs + (size_t)t * C,
+        ref_scalar(vals, scales, biases, R, C, xsr + (size_t)t * C,
                    ref + (size_t)t * R);
     if (ds4f_mlx4_matvec_batch(vals, scales, biases, R, C, B, xs, got) != 0) {
         printf("batch returned -1\n");

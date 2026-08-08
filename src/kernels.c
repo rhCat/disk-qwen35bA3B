@@ -6,6 +6,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
 
 static int g_simd = 1;
 static __thread int g_in_expert = 0;
@@ -444,7 +447,9 @@ int ds4f_mlx4_matvec2(const uint32_t *v1, const uint16_t *s1,
 }
 
 /* ---- batched prefill matvec (M1 of prefill-batch) ---------------- */
-/* Y[B][R] = W[R x C] * X[B][C]. The 4-bit dequant is done ONCE per
+/* Y[B][R] = W[R x C] * X, where X is COLUMN-MAJOR [C][B] (tokens
+ * contiguous per column -- the GEMM layout, so the inner loop reads
+ * a contiguous B-float block). The 4-bit dequant is done ONCE per
  * weight row and reused across the B token vectors -- the prefill
  * win. Bit-identical per (row, token) to ds4f_mlx4_matvec (same
  * accumulation order, same FMA), so e2e traces hold. */
@@ -458,13 +463,27 @@ typedef struct {
 
 static void *mlx4_batch_worker(void *arg) {
     Mlx4BatchJob *j = (Mlx4BatchJob *)arg;
-    const int C = j->C, B = j->B;
+    const int C = j->C;
+    int B = j->B;
+    /* per-token accumulators in registers: ys[t*R+r] scattered writes
+     * (32KB stride) were the pathology -- ~1GB of scattered stores per
+     * matvec. Accumulate in a local array, write ys once per row. */
+    float acc[512];
+    if (B > 512) B = 512;
     for (int r = j->r0; r < j->r1; r++) {
-        /* decode this row ONCE: 16-entry LUT per 64-group */
+        /* decode this row ONCE: 16-entry LUT per 64-group. The group
+         * index is ABSOLUTE across the R*C matrix -- (r*C+c)/64 --
+         * exactly like ds4f_simd_mlx4_matvec (simd.c:158). For rows
+         * with C%64==0 this is r*(C/64) + c/64; using per-row c/64
+         * reads ROW 0's scales for every row (a 2x z-rms divergence
+         * that compounding through the delta-rule state completely
+         * derailed generation). */
         float lut[16];
         int gcur = -1;
+        long rbase = (long)r * C;
+        for (int t = 0; t < B; t++) acc[t] = 0.0f;
         for (int c = 0; c < C; c++) {
-            int g = c / DS4F_MLX4_GROUP;
+            int g = (int)((rbase + c) / DS4F_MLX4_GROUP);
             if (g != gcur) {
                 gcur = g;
                 uint32_t sb = (uint32_t)j->scales[g] << 16;
@@ -477,9 +496,28 @@ static void *mlx4_batch_worker(void *arg) {
             int q = (int)((j->vals[(size_t)r * (C / 8) + (c >> 3)] >>
                            (4 * (c & 7))) & 0xFu);
             float w = lut[q];
+            /* xs is [C][B]: tokens contiguous per column */
+            const float *xcol = j->xs + (size_t)c * B;
+#ifdef __aarch64__
+            if (ds4f_kernels_simd()) {
+                /* NEON: 4 tokens in parallel. Each acc[t] keeps the
+                 * SAME c-order accumulation as the scalar loop and
+                 * vmlaq matches -O2 fp-contract, so per-token results
+                 * are bit-identical to the scalar reference. */
+                int t = 0;
+                for (; t + 4 <= B; t += 4) {
+                    float32x4_t av = vld1q_f32(acc + t);
+                    float32x4_t xv = vld1q_f32(xcol + t);
+                    vst1q_f32(acc + t, vmlaq_n_f32(av, xv, w));
+                }
+                for (; t < B; t++) acc[t] += w * xcol[t];
+            } else
+#endif
             for (int t = 0; t < B; t++)
-                j->ys[(size_t)t * j->R + r] += w * j->xs[(size_t)t * C + c];
+                acc[t] += w * xcol[t];
         }
+        for (int t = 0; t < B; t++)
+            j->ys[(size_t)t * j->R + r] = acc[t];
     }
     return NULL;
 }
