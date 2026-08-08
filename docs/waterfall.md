@@ -42,6 +42,35 @@ The fetch phase grows the most with context (25 ms at 5 tokens ->
 includes the first-token state fill; the delta rule is O(1) per
 token).
 
+## History (how the waterfall moved this session)
+
+| commit | change | s/token (5-tok) | s/token (2K) | attn | moe | fetch |
+|---|---|---|---|---|---|---|
+| 02a1341 | row-split main | 0.17 | 0.192 | 70.8 | 47.4 | 24.8 |
+| f466206 | NEON delta rule | 0.14-0.15 | **0.168** | 57.7 | 47.5 | 22.4 |
+| 0274c92 | persistent fetch pool | 0.14 | — | 56.7 | 47.9 | 23.2 |
+
+## The fetch investigation (0274c92) -- what was measured, what it proved
+
+The fetch phase (16-23% of the waterfall) was 22-38 ms for a ~3.5 ms
+raw disk read, so the first hypothesis was spawn/join churn. Built a
+persistent fetch pool (4 workers, claim/completion latches, no
+per-layer pthread_create) -- 19/19 tests -- and measured:
+
+| config | hits | misses/tok | disk bytes | fetch phase |
+|---|---|---|---|---|
+| cache-gb 5 (baseline) | ~70% | ~46 | 78 MB/tok | 23.2 ms |
+| cache-gb 8 (bigger cache) | 89.1% | ~37 | 62 MB/tok | 22.4 ms |
+
+Verdict: **fetch is disk-throughput-bound** (~4 GB/s parallel pread,
+near NVMe capability). Neither the pool nor a 60% bigger cache moves
+it. The 8 P-cores are NOT idle during fetch in a fixable way: the
+router for layer L+1 needs moe(L)'s output (strict serial
+dependency), and speculative prefetch is dead on arrival -- measured
+adjacent-layer expert overlap is 3.6%, token-to-token 18.3%, so a
+guess would be ~96% wrong. The route->fetch->compute serialization
+is irreducible without a router predictor.
+
 ## What each phase IS (from the code)
 
 - **attn** (40-44%): the Gated DeltaNet linear attention -- 39/40
