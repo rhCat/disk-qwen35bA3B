@@ -366,3 +366,79 @@ void ds4f_f16_matvec(const uint16_t *W, int R, int C, const float *x,
         y[r] = acc;
     }
 }
+
+/* ---- combined two-matvec row split (qkv + z, one spawn) ---------- */
+typedef struct {
+    const uint32_t *v1; const uint16_t *s1, *b1; int R1;
+    const uint32_t *v2; const uint16_t *s2, *b2; int R2;
+    int C;
+    const float *x;
+    float *y1, *y2;
+    int r0, r1;          /* combined row range [r0, r1) over R1+R2 */
+} Mlx4RowJob2;
+
+static void *mlx4_row_worker2(void *arg) {
+    Mlx4RowJob2 *j = (Mlx4RowJob2 *)arg;
+    /* combined row space: [0,R1) -> matvec 1, [R1, R1+R2) -> matvec 2 */
+    if (j->r1 <= j->R1) {
+        ds4f_simd_mlx4_matvec(j->v1, j->s1, j->b1, j->R1, j->C,
+                              j->x, j->y1, j->r0, j->r1);
+    } else if (j->r0 >= j->R1) {
+        ds4f_simd_mlx4_matvec(j->v2, j->s2, j->b2, j->R2, j->C,
+                              j->x, j->y2, j->r0 - j->R1, j->r1 - j->R1);
+    } else {
+        ds4f_simd_mlx4_matvec(j->v1, j->s1, j->b1, j->R1, j->C,
+                              j->x, j->y1, j->r0, j->R1);
+        ds4f_simd_mlx4_matvec(j->v2, j->s2, j->b2, j->R2, j->C,
+                              j->x, j->y2, 0, j->r1 - j->R1);
+    }
+    return NULL;
+}
+
+/* Two independent MLX4 matvecs with the same x, computed in ONE
+ * 8-way row split over the combined row space (R1+R2). The linear
+ * attention qkv (8192 rows) and z (4096) projections both read xin
+ * and write disjoint outputs -- running them sequentially cost two
+ * spawn/join cycles per layer; this overlaps them. Same per-row
+ * math as ds4f_mlx4_matvec (bit-identical rows), just partitioned
+ * together. Returns 0 if both computed, -1 on fallback. */
+int ds4f_mlx4_matvec2(const uint32_t *v1, const uint16_t *s1,
+                      const uint16_t *b1, int R1,
+                      const uint32_t *v2, const uint16_t *s2,
+                      const uint16_t *b2, int R2, int C,
+                      const float *x, float *y1, float *y2) {
+    if (!ds4f_kernels_simd() || (C % 8) != 0 ||
+        (C % DS4F_MLX4_GROUP) != 0 || R1 < 1 || R2 < 1)
+        return -1;
+    if (ds4f_kernels_in_expert()) return -1;   /* expert threads: no spawn */
+    int nth = 8;
+    const char *env = getenv("DS4F_ATTN_THREADS");
+    if (env) {
+        int v = atoi(env);
+        if (v >= 1 && v <= 32) nth = v;
+    }
+    if (nth < 2) {
+        ds4f_simd_mlx4_matvec(v1, s1, b1, R1, C, x, y1, 0, R1);
+        ds4f_simd_mlx4_matvec(v2, s2, b2, R2, C, x, y2, 0, R2);
+        return 0;
+    }
+    int total = R1 + R2;
+    int chunk = (total + nth - 1) / nth;
+    pthread_t th[32];
+    Mlx4RowJob2 job[32];
+    int nspawn = 0;
+    for (int t = 0; t < nth; t++) {
+        int r0 = t * chunk;
+        int r1 = (t + 1) * chunk < total ? (t + 1) * chunk : total;
+        if (r0 >= total) continue;
+        job[t].v1 = v1; job[t].s1 = s1; job[t].b1 = b1; job[t].R1 = R1;
+        job[t].v2 = v2; job[t].s2 = s2; job[t].b2 = b2; job[t].R2 = R2;
+        job[t].C = C; job[t].x = x; job[t].y1 = y1; job[t].y2 = y2;
+        job[t].r0 = r0; job[t].r1 = r1;
+        pthread_create(&th[t], NULL, mlx4_row_worker2, &job[t]);
+        nspawn++;
+    }
+    for (int t = 0; t < nspawn; t++)
+        pthread_join(th[t], NULL);
+    return 0;
+}

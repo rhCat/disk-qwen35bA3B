@@ -31,6 +31,13 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double now_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
 
 static float bf16_f(uint16_t h) {
     uint32_t bits = (uint32_t)h << 16;
@@ -471,9 +478,29 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
         memcpy(xin, state, (size_t)H * sizeof(float));
     }
 
-    if (mlx4_proj(tl, pi, ps, pb, tr, qkv_rows, cols, xin, qkv) != 0 ||
-        mlx4_proj(tl, zi, zs, zb, tr, z_rows, cols, xin, z) != 0) {
-        return -1;
+    double _tproj = 0;
+    if (getenv("DS4F_PROJ_MS")) _tproj = now_s();
+    if (ds4f_mlx4_matvec2(
+            (const uint32_t *)(const void *)(tr + tl->t[pi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[ps].off),
+            pb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[pb].off)
+                    : NULL, qkv_rows,
+            (const uint32_t *)(const void *)(tr + tl->t[zi].off),
+            (const uint16_t *)(const void *)(tr + tl->t[zs].off),
+            zb >= 0 ? (const uint16_t *)(const void *)(tr + tl->t[zb].off)
+                    : NULL, z_rows,
+            cols, xin, qkv, z) != 0) {
+        if (mlx4_proj(tl, pi, ps, pb, tr, qkv_rows, cols, xin, qkv) != 0 ||
+            mlx4_proj(tl, zi, zs, zb, tr, z_rows, cols, xin, z) != 0) {
+            return -1;
+        }
+    }
+    if (getenv("DS4F_PROJ_MS")) {
+        static double _pacc = 0; static long _pcnt = 0;
+        _pacc += now_s() - _tproj; _pcnt++;
+        if (_pcnt <= 3 || _pcnt % 100 == 0)
+            fprintf(stderr, "[proj] L%d qkv+z: %.2f ms (avg %.2f)\n",
+                    L, (now_s() - _tproj) * 1e3, _pacc / _pcnt * 1e3);
     }
     float a32[32], b32[32];
     {
