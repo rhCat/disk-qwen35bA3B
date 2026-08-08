@@ -433,7 +433,8 @@ static int gqa_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
  * [xin H][qkv qkv_rows][z z_rows][o o_rows][readout v_heads*vd][qk]. */
 static int lin_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                     const uint8_t *tr, Ds4fKvCache *kv, int token,
-                    float *state, float *qkv, float *z, float *buf) {
+                    float *state, float *qkv, float *z, float *buf,
+                    int skip_o) {
     int pi = tl->q3_pqkv[L], ps = tl->q3_pqkvs[L], pb = tl->q3_pqkvb[L];
     int zi = tl->q3_pz[L], zs = tl->q3_pzs[L], zb = tl->q3_pzb[L];
     int ai = tl->q3_pa[L], as_ = tl->q3_pas[L], ab = tl->q3_pab[L];
@@ -761,10 +762,14 @@ static int lin_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             }
         }
     }
-    /* out_proj(readout) -> o, residual add */
+    /* out_proj(readout) -> o, residual add. When skip_o is set (the
+     * chunk path), the o_proj is deferred and batched over the chunk
+     * (M4: same 8.4 MB tensor, B readouts); the residual is also
+     * deferred so the caller can add after the batched o. */
     double _to = 0;
     if (getenv("DS4F_PROJ_MS")) _to = now_s();
-    if (mlx4_proj(tl, oi, os_, ob, tr, o_rows, v_heads * vd, readout, o)
+    if (!skip_o &&
+        mlx4_proj(tl, oi, os_, ob, tr, o_rows, v_heads * vd, readout, o)
         != 0) {
         fprintf(stderr, "[linbody] L%d o proj FAIL oi=%d os_=%d\n", L, oi, os_);
         return -1;
@@ -824,7 +829,8 @@ static int lin_body(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
                 z[0], z[1], z[2], z[3],
                 xin[0], xin[1], xin[2], xin[3]);
     }
-    for (int i = 0; i < H; i++) state[i] += o[i];
+    if (!skip_o)
+        for (int i = 0; i < H; i++) state[i] += o[i];
     return 0;
 }
 
@@ -956,7 +962,7 @@ static int linear_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
             fclose(pf);
         }
     }
-    return lin_body(cfg, tl, L, tr, kv, token, state, qkv, z, buf);
+    return lin_body(cfg, tl, L, tr, kv, token, state, qkv, z, buf, 0);
 
     return 0;
 }
@@ -1066,7 +1072,19 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
         }
     }
 
-    /* 3) serial per-token body: conv ring + delta state in token order */
+    /* 3) serial per-token body: conv ring + delta state in token
+     * order. o_proj is DEFERRED (skip_o): the readout is collected
+     * per token and the shared 8.4 MB o tensor is batched in step 4
+     * (M4 -- same bit-identical kernel, B readouts amortize the
+     * dequant). */
+    int v_heads2 = cfg->n_kv_heads > 0 ? cfg->n_kv_heads * 16 : 32;
+    int ro_cols = v_heads2 * 128;              /* readout width */
+    float *readouts = (float *)malloc((size_t)B * (size_t)ro_cols *
+                                      sizeof(float));
+    float *obatch = (float *)malloc((size_t)B * (size_t)o_rows *
+                                    sizeof(float));
+    if (!readouts || !obatch) { free(xs); free(bbuf);
+                                free(readouts); free(obatch); return -1; }
     for (int b = 0; b < B; b++) {
         float *qkv = qkvs + (size_t)b * qkv_rows;
         float *z = zbtok + (size_t)b * z_rows;
@@ -1079,11 +1097,35 @@ int ds4f_attn_linear_chunk(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl,
         memcpy(bqkv, qkv, (size_t)qkv_rows * sizeof(float));
         memcpy(bz, z, (size_t)z_rows * sizeof(float));
         if (lin_body(cfg, tl, L, tr, kv, t0 + b, states[b], bqkv, bz,
-                     bbuf) != 0) {
-            free(xs); free(bbuf);
+                     bbuf, 1) != 0) {
+            free(xs); free(bbuf); free(readouts); free(obatch);
             return -1;
         }
+        /* readout = o region + o_rows (lin_body's layout, skip_o
+         * leaves it at the post-RMSNormGated state) */
+        memcpy(readouts + (size_t)b * ro_cols,
+               bbuf + H + qkv_rows + z_rows + o_rows,
+               (size_t)ro_cols * sizeof(float));
     }
+    /* 4) batched o_proj: one row-decode, B readouts through the same
+     * accumulator map -- bit-identical to B serial mlx4_proj calls */
+    if (ds4f_mlx4_matvec_batch(
+            (const uint32_t *)(const void *)(tr + tl->t[tl->q3_opa[L]].off),
+            (const uint16_t *)(const void *)(tr + tl->t[tl->q3_opas[L]].off),
+            tl->q3_opab[L] >= 0
+                ? (const uint16_t *)(const void *)(tr + tl->t[tl->q3_opab[L]].off)
+                : NULL,
+            o_rows, ro_cols, B, readouts, obatch) != 0) {
+        free(xs); free(bbuf); free(readouts); free(obatch);
+        return -1;                 /* caller falls back to serial */
+    }
+    /* 5) residual add (deferred from lin_body) */
+    for (int b = 0; b < B; b++) {
+        float *st = states[b];
+        const float *o = obatch + (size_t)b * o_rows;
+        for (int i = 0; i < H; i++) st[i] += o[i];
+    }
+    free(readouts); free(obatch);
     _chk_acc[0] += now_s() - _tch; _chk_n++;
     if (_chk_n <= 40 || _chk_n % 80 == 0)
         fprintf(stderr, "[chunk] L%d B=%d total %.2f ms (avg %.2f)\n",
