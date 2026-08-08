@@ -1004,22 +1004,32 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     }
     float rms_in = sqrtf((float)(ss_in / (double)H));
 
-    float *latent = (float *)calloc((size_t)D, sizeof(float));
-    float *cur    = (float *)calloc((size_t)D, sizeof(float));
-    float *out    = (float *)calloc((size_t)D, sizeof(float));
-    float *acc    = (float *)calloc((size_t)D, sizeof(float));
-    /* per-job work buffers (out + cur/tmp/chain), allocated once per
-     * call in ONE block -- never malloc per fetch (exp_run). Per job:
-     * out (Lat floats) + cur/tmp/chain (3 x D floats). */
+    /* Persistent per-call scratch matrix: latent/cur/out/acc (D each)
+     * + jobbuf (maxjob x perjob) were calloc'd and freed 40x/token --
+     * ~288KB x 40 layers x tokens of allocator churn. Now ONE
+     * thread-local block, grown on demand, reused across calls (the
+     * caller's warm scratch already follows this pattern). The
+     * zero-init is preserved: calloc on first touch, memset reuse. */
     int maxjob = cfg->topk > 64 ? 64 : cfg->topk;
     if (maxjob < 1) maxjob = 1;
     long perjob = (long)Lat + 3L * D;
-    float *jobbuf = (float *)calloc((size_t)maxjob * (size_t)perjob,
-                                    sizeof(float));
-    if (!latent || !cur || !out || !acc || !jobbuf) {
-        free(latent); free(cur); free(out); free(acc); free(jobbuf);
-        return -1;
+    size_t need = (size_t)(4 * D + maxjob * perjob) * sizeof(float);
+    static __thread float *tl_moe = NULL;
+    static __thread size_t tl_moe_cap = 0;
+    if (need > tl_moe_cap) {
+        float *nb = (float *)realloc(tl_moe, need);
+        if (!nb) return -1;
+        tl_moe = nb;
+        tl_moe_cap = need;
+        memset(tl_moe, 0, need);       /* keep the calloc zero-init */
+    } else {
+        memset(tl_moe, 0, need);
     }
+    float *latent = tl_moe;
+    float *cur    = tl_moe + (size_t)D;
+    float *out    = tl_moe + 2 * (size_t)D;
+    float *acc    = tl_moe + 3 * (size_t)D;
+    float *jobbuf = tl_moe + 4 * (size_t)D;
     (void)cur;              /* expert chains now run in worker threads */
     (void)scratch;          /* job 0 uses the caller's warm buffer */
 
@@ -1166,14 +1176,14 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
          * the caller's pool -- never malloc per call (page faults). */
         jb->scratch = (njob == 0) ? scratch : job_scratch[njob - 1];
         if (!jb->out || !jb->scratch) {
-            free(latent); free(cur); free(out); free(acc); free(jobbuf);
+            /* TLS scratch: process-lifetime, no free */
             return -1;
         }
         jb->Lat = Lat;
         jb->D = D;
         jb->scratch_n = scratch_n;
         if (pthread_create(&th[njob], NULL, exp_run, jb) != 0) {
-            free(latent); free(cur); free(out); free(acc); free(jobbuf);
+            /* TLS scratch: process-lifetime, no free */
             return -1;
         }
         njob++;
@@ -1183,7 +1193,7 @@ int ds4f_moe_step(const Ds4fCfg *cfg, const Ds4fTrunkLayout *tl, int L,
     for (int j = 0; j < njob; j++) {
         ExpJob *jb = &job[j];
         if (jb->fail) {
-            free(latent); free(cur); free(out); free(acc); free(jobbuf);
+            /* TLS scratch: process-lifetime, no free */
             return -1;
         }
         *n_matvec += jb->n_matvec;
@@ -1441,6 +1451,6 @@ gpu_combined:
 
     free(orig);
     free(xin);
-    free(latent); free(cur); free(out); free(acc); free(jobbuf);
+    /* TLS scratch: process-lifetime, no free */
     return 0;
 }
